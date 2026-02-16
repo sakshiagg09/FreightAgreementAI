@@ -25,6 +25,9 @@ _charge_type_storage: Dict[str, str] = {}
 # Session-level rate card Excel path from select_rate_card_fields: session_id -> excel_file_path
 _rate_card_path_storage: Dict[str, str] = {}
 
+# Session-level Excel header row (0-based) for "header far down" templates; None = use default (2)
+_excel_header_row_storage: Dict[str, Optional[int]] = {}
+
 def set_session_id(session_id: str):
     """Set the current session ID in context"""
     _current_session_id.set(session_id)
@@ -139,7 +142,26 @@ def store_column_mapping(session_id: str, mapping: dict):
     logger.info(f"Stored column mapping for session {session_id}: {list(_column_mapping_storage[session_id].keys())}")
 
 
-def get_column_mapping(session_id: Optional[str] = None) -> Optional[dict]:
+def store_excel_header_row(session_id: str, header_row: int) -> None:
+    """
+    Store the 0-based Excel header row for "header far down" templates.
+    Used by batch_upload_to_sap so it reads with header=header_row.
+    """
+    _excel_header_row_storage[session_id] = header_row
+    logger.info(f"Stored Excel header row for session {session_id}: {header_row}")
+
+
+def get_excel_header_row(session_id: Optional[str] = None) -> Optional[int]:
+    """
+    Get the stored Excel header row (0-based). Returns None if not set;
+    caller should use default (e.g. 2) when None.
+    """
+    if session_id is None:
+        session_id = get_session_id()
+    return _excel_header_row_storage.get(session_id)
+
+
+def get_column_mapping(session_id: Optional[str] = None) -> Optional[Dict]:
     """
     Get stored column mapping for current or specified session.
     Returns None if no mapping stored.

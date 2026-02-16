@@ -85,7 +85,8 @@ def match_labels_to_system_fields(
     For each label text, find the best-matching system field by cosine similarity.
 
     Args:
-        label_texts: List of strings (e.g. Excel header labels).
+        label_texts: List of strings (e.g. Excel header labels, or merged multi-row
+            headers like "Origin Origin Postal Code" for template-aware matching).
         similarity_threshold: Minimum cosine similarity to count as a match.
 
     Returns:
