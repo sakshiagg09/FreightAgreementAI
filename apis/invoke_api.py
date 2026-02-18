@@ -5,7 +5,7 @@ from typing import Optional
 from fastapi import FastAPI, UploadFile, File, Form, APIRouter
 from google.genai import types  # type: ignore
 from agent.logistics_agent import runner, session_service
-from utils.session_context import set_session_id
+from utils.session_context import set_session_id, get_agreement_id, get_agreement_uuid
 from utils.llm_usage import reset_llm_usage, get_llm_usage
 from config.dev_config import TEMP_UPLOADS_DIR, APP_NAME, DEFAULT_USER_ID
 
@@ -121,11 +121,18 @@ async def invoke(
                     api_span.set_status(Status(StatusCode.OK))
 
                 usage = get_llm_usage(session_id)
-                return {
+                out = {
                     "session_id": session_id,
                     "response": final_response or "I'm ready to help. Please provide the document.",
                     "usage": usage,
                 }
+                agreement_id = get_agreement_id(session_id)
+                agreement_uuid = get_agreement_uuid(session_id)
+                if agreement_id is not None:
+                    out["agreement_id"] = agreement_id
+                if agreement_uuid is not None:
+                    out["agreement_uuid"] = agreement_uuid
+                return out
             except Exception as e:
                 logger.error(f"Invoke API failed: {e}", exc_info=True)
                 # Set error status on API span - MUST be set before context exits
@@ -159,11 +166,18 @@ async def invoke(
                 agent_tracer.set_output(final_response or "I'm ready to help. Please provide the document.")
 
             usage = get_llm_usage(session_id)
-            return {
+            out = {
                 "session_id": session_id,
                 "response": final_response or "I'm ready to help. Please provide the document.",
                 "usage": usage,
             }
+            agreement_id = get_agreement_id(session_id)
+            agreement_uuid = get_agreement_uuid(session_id)
+            if agreement_id is not None:
+                out["agreement_id"] = agreement_id
+            if agreement_uuid is not None:
+                out["agreement_uuid"] = agreement_uuid
+            return out
         except Exception as e:
             logger.error(f"Invoke API failed: {e}", exc_info=True)
             return {"error": str(e)}

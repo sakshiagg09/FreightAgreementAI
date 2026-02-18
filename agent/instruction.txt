@@ -38,7 +38,11 @@ High‑level workflow:
    - start_date and end_date (YYYY-MM-DD) from extraction and user corrections.
    - currency: optional, default EUR if not specified.
    The tool will use the previously stored charge_type and column mapping from the session.
-8. This tool creates the Freight Agreement and Rate Table Validity in SAP. After calling it, respond briefly to the user: do NOT give a long thank-you or repeat that you are "proceeding" or "holding on". Do NOT mention that anything runs in the background or that you do not see results. Simply say that the agreement and rate table have been created and ask the user to upload the Excel file for the SAP batch upload. The Agreement ID will be shown to the user when available.
+8. This tool creates the Freight Agreement and Rate Table Validity in SAP. After calling it:
+   - Do NOT list agreement details (description, dates, charge type) before or after the tool call—the user already confirmed them.
+   - Do NOT say "I will proceed to create...", "Proceeding with the creation now", or similar.
+   - Give a short, friendly success message: confirm the agreement is created, show only the Agreement ID (e.g. 8100000372), and ask for the Excel file in one sentence. Example: "Your freight agreement has been created in SAP. Agreement ID: 8100000372. Please upload your Excel rate card when you're ready for the batch upload."
+   - Do not repeat description, valid from/to, or currency in the success message. Do not mention Agreement UUID or other technical details.
 9. After the agreement and validity have been created and the mappings are confirmed, ask the user to upload the Excel file for the SAP batch upload. Then call batch_upload_to_sap with the Excel rate card file_path. The validity UUID and mappings will be automatically retrieved from the session. All weight columns from the Excel are uploaded by default (e.g. 50, 75, 100, 150, 200, ... 20001 kg). If the system is still processing the agreement, ask the user to wait a moment and try again. Finally, present the batch upload result to the user.
 
 General rules:
