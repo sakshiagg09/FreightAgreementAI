@@ -12,7 +12,7 @@ import requests
 from google.adk.tools import FunctionTool
 from utils.system_field_mapping import SYSTEM_FIELD_MAPPING
 from utils.excel_semantic_embedding import match_labels_to_system_fields
-from utils.session_context import get_session_id, store_column_mapping, store_excel_header_row
+from utils.session_context import get_session_id, store_column_mapping, store_excel_header_row, store_rate_card_path
 
 # Import Phoenix tracing
 from utils.phoenix_tracing import spa_upload_tracer
@@ -240,9 +240,9 @@ def _detect_header_row(df: pd.DataFrame) -> int | None:
 
 
 def _extract_semantic_units(
-        df: pd.DataFrame,
-        start_row: int = 0,
-        max_rows: int | None = None,
+    df: pd.DataFrame,
+    start_row: int = 0,
+    max_rows: int | None = None,
 ) -> list[tuple[int, int, str]]:
     """
     Extract (row, col, text) for cells that look like metadata.
@@ -266,9 +266,9 @@ def _extract_semantic_units(
 
 
 def _extract_merged_column_labels(
-        df: pd.DataFrame,
-        max_rows: int = MAX_MERGED_HEADER_ROWS,
-        start_row: int = 0,
+    df: pd.DataFrame,
+    max_rows: int = MAX_MERGED_HEADER_ROWS,
+    start_row: int = 0,
 ) -> list[tuple[int, str]]:
     """
     Build one label per column by merging non-empty cell text from rows
@@ -293,7 +293,7 @@ def _extract_merged_column_labels(
 
 
 def _extract_merged_row_labels(
-        df: pd.DataFrame, max_cols: int = MAX_MERGED_HEADER_COLS
+    df: pd.DataFrame, max_cols: int = MAX_MERGED_HEADER_COLS
 ) -> list[tuple[int, str]]:
     """
     Build one label per row by merging non-empty cell text from the first max_cols.
@@ -339,7 +339,7 @@ def _infer_layout(matches: list[tuple[int, int, str, float]]) -> tuple[str, int]
 
 
 def _column_display_name(
-        df: pd.DataFrame, row: int, col: int, fallback: str, header_row_for_name: int | None
+    df: pd.DataFrame, row: int, col: int, fallback: str, header_row_for_name: int | None
 ) -> str:
     """
     Prefer the cell at header_row_for_name for downstream (e.g. pandas header=2).
@@ -517,13 +517,13 @@ def select_rate_card_fields(file_path: str) -> str:
 
         # Choose best strategy: prefer merged column if it gives enough matches (multi-row template)
         use_merged_column = (
-                len(merged_col_matches) >= MIN_MERGED_MATCHES_TO_PREFER
-                and len(merged_col_matches) >= len(merged_row_matches)
+            len(merged_col_matches) >= MIN_MERGED_MATCHES_TO_PREFER
+            and len(merged_col_matches) >= len(merged_row_matches)
         )
         use_merged_row = (
-                not use_merged_column
-                and len(merged_row_matches) >= MIN_MERGED_MATCHES_TO_PREFER
-                and len(merged_row_matches) > len(merged_col_matches)
+            not use_merged_column
+            and len(merged_row_matches) >= MIN_MERGED_MATCHES_TO_PREFER
+            and len(merged_row_matches) > len(merged_col_matches)
         )
 
         if use_merged_column:
@@ -597,10 +597,33 @@ def select_rate_card_fields(file_path: str) -> str:
         system_field_keys = [m["system_field_key"] for m in unique_matched]
         final_fields = system_field_keys + ordered_weight_cols
 
-        # Store mapping for SAP / downstream (system_field_key -> excel_column_name)
-        column_mapping = {m["system_field_key"]: m["excel_column"] for m in unique_matched}
+        # Store mapping for SAP / downstream (system_field_key -> excel_column_name).
+        # For origin/destination zone columns, normalize composite merged headers to the
+        # first segment (e.g. "Origin country Minimum € / km ..." -> "Origin country")
+        # so SAP upload can find the column when Excel is read with a single header row.
+        _ORIGIN_DEST_ZONE_KEYS = frozenset({
+            "SOURCELOC_ZONE", "SOURCELOC", "SOURCELOC_CNTRY", "SRCLOC_UNLOCD", "SRC_UNLOCD",
+            "DESTLOC_ZONE", "DESTLOC", "DESTLOC_CNTRY", "DESTLOC_UNLOCD", "DEST_UNLOCD",
+        })
+        _COMPOSITE_HEADER_MARKERS = (" Minimum", " € ", " €/km", " €/ km", "/km")
+
+        def _normalize_origin_dest_column(excel_col: str, system_key: str) -> str:
+            if system_key not in _ORIGIN_DEST_ZONE_KEYS or not excel_col:
+                return excel_col
+            for marker in _COMPOSITE_HEADER_MARKERS:
+                idx = excel_col.find(marker)
+                if idx > 0:
+                    return excel_col[:idx].strip()
+            return excel_col
+
+        column_mapping = {}
+        for m in unique_matched:
+            key = m["system_field_key"]
+            excel_col = _normalize_origin_dest_column(m["excel_column"], key)
+            column_mapping[key] = excel_col
         session_id = get_session_id()
         store_column_mapping(session_id, column_mapping)
+        store_rate_card_path(session_id, file_path)
         if use_header_far_down:
             store_excel_header_row(session_id, header_start)
 
@@ -617,7 +640,7 @@ def select_rate_card_fields(file_path: str) -> str:
             entry = SYSTEM_FIELD_MAPPING.get(sys_key)
             description = entry[1] if entry else sys_key
             mapping_display.append({
-                "excel_column": m["excel_column"],
+                "excel_column": column_mapping.get(sys_key, m["excel_column"]),
                 "system_field_key": sys_key,
                 "system_field_description": description,
             })

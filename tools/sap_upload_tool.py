@@ -26,6 +26,7 @@ from utils.session_context import (
     get_session_id,
     get_validity_uuid,
     get_column_mapping,
+    get_excel_header_row,
     get_rate_card_path,
 )
 from utils.system_field_mapping import SYSTEM_FIELD_MAPPING
@@ -114,21 +115,60 @@ def _resolve_excel_column_to_df_column(df: pd.DataFrame, excel_col_name: str) ->
     return None
 
 
+# -------------------------------------------------------
+# Helper: Resolve mapping column to actual DataFrame column (handles composite headers)
+# -------------------------------------------------------
+def _resolve_mapping_column_to_df_column(df: pd.DataFrame, excel_col_name: str) -> str | None:
+    """
+    Resolve the stored mapping column name (from select_rate_card_fields) to an actual
+    column in the DataFrame. Handles composite headers where the stored value is a
+    concatenation of multiple header cells (e.g. "Origin country Minimum € / km ...")
+    but the Excel was read with a single header row so df.columns has "Origin country",
+    "Minimum", "€ / km", etc.
+    """
+    if not excel_col_name or not isinstance(df.columns, pd.Index):
+        return None
+
+    # 1) Exact or case-insensitive match
+    resolved = _resolve_excel_column_to_df_column(df, excel_col_name)
+    if resolved is not None:
+        return resolved
+
+    # 2) Stored value not in df.columns (e.g. composite from merged multi-row header).
+    #    Find the longest df column that is a prefix of the stored value (normalized).
+    excel_stripped = excel_col_name.strip()
+    excel_lower = excel_stripped.lower()
+    candidates = [
+        col for col in df.columns
+        if col and excel_lower.startswith(str(col).strip().lower())
+    ]
+    if candidates:
+        # Prefer longest match so "Origin country" wins over "Origin"
+        return max(candidates, key=lambda c: len(str(c).strip()))
+
+    # 3) Stored value might start with the logical column (e.g. "Origin country" in sheet,
+    #    but stored as "Origin country Minimum ..."). Already covered by (2).
+
+    return None
+
+
 
 # -------------------------------------------------------
 # Read Excel
 # -------------------------------------------------------
-def _read_excel(excel_file_path: str) -> pd.DataFrame:
+def _read_excel(excel_file_path: str, header_row: int | None = None) -> pd.DataFrame:
     """
-    Read the Excel rate card using the SAME header row convention
-    as select_rate_card_fields (third physical row, header=2).
-    This keeps DataFrame column names consistent with the mapping tool.
+    Read the Excel rate card. Uses header_row (0-based) when provided;
+    otherwise default 2 (third physical row). For "header far down" templates,
+    select_rate_card_fields stores the detected row and it is passed here.
     """
-    df = pd.read_excel(excel_file_path, header=2, sheet_name=0, engine=None)
+    header = header_row if header_row is not None else 2
+    df = pd.read_excel(excel_file_path, header=header, sheet_name=0, engine=None)
     logger.debug(
         "Read Excel file for SAP upload.",
         extra={
             "excel_file_path": os.path.abspath(os.path.expanduser(str(excel_file_path))),
+            "header_row": header,
             "columns": list(df.columns),
             "row_count": len(df),
         },
@@ -644,7 +684,8 @@ def batch_upload_to_sap(
         return f"Error: Excel file not found: {excel_file_path}"
 
     try:
-        df = _read_excel(excel_file_path)
+        excel_header_row = get_excel_header_row(session_id)
+        df = _read_excel(excel_file_path, header_row=excel_header_row)
         logger.info(
             f"{SAP_UPLOAD_LOG_PREFIX} Excel loaded: %s rows, %s columns.",
             len(df),
@@ -683,23 +724,40 @@ def batch_upload_to_sap(
             column_mapping,
             ["Destination Location", "Transportation Zone of Destination Location"],
         )
+        # Resolve to actual DataFrame column (handles composite headers from merged rows,
+        # e.g. "Origin country Minimum € / km ..." -> "Origin country")
+        if origin_col:
+            origin_col = _resolve_mapping_column_to_df_column(df, origin_col) or origin_col
+        if dest_col:
+            dest_col = _resolve_mapping_column_to_df_column(df, dest_col) or dest_col
+
         weight_col_long = column_mapping.get("GROSS_WEIGHT")
         amount_col_long = column_mapping.get("GOODS_VALUE")
         currency_col = currency_column or column_mapping.get("CURRENCY")
+        # Resolve to actual DataFrame columns (handles composite headers)
+        if weight_col_long:
+            weight_col_long = _resolve_mapping_column_to_df_column(df, weight_col_long) or weight_col_long
+        if amount_col_long:
+            amount_col_long = _resolve_mapping_column_to_df_column(df, amount_col_long) or amount_col_long
+        if currency_col:
+            currency_col = _resolve_mapping_column_to_df_column(df, currency_col) or currency_col
 
-        # Validate required
+        # Validate required: origin is mandatory
         if not origin_col or origin_col not in df.columns:
             logger.error(
                 f"{SAP_UPLOAD_LOG_PREFIX} Origin column not found in DataFrame.",
                 extra={"origin_col": origin_col, "df_columns": list(df.columns)},
             )
-            return f"Error: Origin column '{origin_col}' not found."
+            return f"Error: Origin column not found in the Excel file. The system expected a column for 'Transportation Zone of Source Location' (e.g. 'Origin country'). Please ensure the rate card has an origin column and that column mapping was run (select_rate_card_fields)."
+
+        # Destination optional: if rate card has no destination column (origin-only matrix),
+        # use origin as destination so each row becomes (origin, origin) with the rate.
         if not dest_col or dest_col not in df.columns:
-            logger.error(
-                f"{SAP_UPLOAD_LOG_PREFIX} Destination column not found in DataFrame.",
-                extra={"dest_col": dest_col, "df_columns": list(df.columns)},
+            dest_col = origin_col
+            logger.info(
+                f"{SAP_UPLOAD_LOG_PREFIX} No destination column in Excel; using origin as destination (origin-only rate card).",
+                extra={"origin_col": origin_col},
             )
-            return f"Error: Destination column '{dest_col}' not found."
 
         # Detect format
         is_long_format = bool(weight_col_long and amount_col_long)

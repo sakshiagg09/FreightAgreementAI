@@ -5,7 +5,7 @@ from typing import Optional
 from fastapi import FastAPI, UploadFile, File, Form, APIRouter
 from google.genai import types  # type: ignore
 from agent.logistics_agent import runner, session_service
-from utils.session_context import set_session_id
+from utils.session_context import set_session_id, store_rate_card_path
 from utils.llm_usage import reset_llm_usage, get_llm_usage
 from config.dev_config import TEMP_UPLOADS_DIR, APP_NAME, DEFAULT_USER_ID
 
@@ -57,6 +57,9 @@ async def invoke(
                 f.write(file_content)
             
             logger.info(f"File uploaded successfully: {file_path} (original: {original_filename})")
+            # Store path for this session so batch_upload_to_sap can use it when called without args
+            if file_ext.lower() in (".xls", ".xlsx"):
+                store_rate_card_path(session_id, file_path)
             actual_message += f" [FILE_UPLOADED: {file_path}]"
         except Exception as e:
             logger.error(f"Error saving uploaded file: {e}", exc_info=True)
