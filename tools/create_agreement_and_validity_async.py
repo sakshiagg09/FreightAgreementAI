@@ -89,7 +89,7 @@ def create_agreement_and_validity_async(
         daemon=True,
     )
     thread.start()
-    return "Agreement and rate table validity creation started in the background."
+    return "Freight Agreement and Rate Table Validity creation has been started."
 
 
 create_agreement_and_validity_async_tool = FunctionTool(create_agreement_and_validity_async)
