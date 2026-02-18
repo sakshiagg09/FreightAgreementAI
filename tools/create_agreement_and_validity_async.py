@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 # Message returned when running in background (no agreement ID available yet)
 ASYNC_RETURN_MESSAGE = (
     "Your freight agreement has been created in SAP. "
-    "Please upload your Excel rate card when you're ready for the batch upload."
+    "we can proceed, for batch upload the rates from the rate card you already provided."
 )
 
 
@@ -59,7 +59,7 @@ def _format_sync_success(result_fa: str, result_rtv: str) -> str:
         return (
             "Your freight agreement has been created in SAP.\n\n"
             f"**Agreement ID:** {agreement_id}\n\n"
-            "Please upload your Excel rate card when you're ready for the batch upload."
+            "we can proceed, for  batch upload the rates from the rate card you already provided."
         )
     return f"{result_fa}\n\n{result_rtv}"
 
