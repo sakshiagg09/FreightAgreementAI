@@ -170,6 +170,14 @@ def select_rate_card_fields(file_path: str) -> str:
                 span.set_status(Status(StatusCode.ERROR, "No valid columns found"))
             return "Error: No valid columns found in the Excel file. Please check the file format."
 
+        def _actual_column(col_name: str) -> str:
+            """Return the exact column name as it appears in the DataFrame for reliable lookup."""
+            col_name = str(col_name).strip()
+            for c in df.columns:
+                if str(c).strip() == col_name:
+                    return c
+            return col_name
+
         # Create a structured list of field mappings for the LLM
         # Format: "FIELD_KEY: Description"
         field_mappings = []
@@ -203,9 +211,6 @@ def select_rate_card_fields(file_path: str) -> str:
           ]
         }}
 
-
-        Weight ranges, FTL, pallet counts, pricing buckets, LOT, SHADOW, etc.
-        usually do NOT have DHL system field mappings — OMIT THEM COMPLETELY from matched_fields.
         If there are no valid matches, return:
          {{ "matched_fields": [] }}
         """
@@ -214,9 +219,9 @@ def select_rate_card_fields(file_path: str) -> str:
         payload = {
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.0,
+            "max_tokens": 4096,
         }
-        print("here")
-        print(payload)
+        logger.debug("Azure OpenAI field-matching request payload (prompt length=%s)", len(prompt))
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
@@ -291,7 +296,6 @@ def select_rate_card_fields(file_path: str) -> str:
 
         # Extract message content
         matched_cols = data.get("matched_fields", [])
-        print(matched_cols)
         # Include weight patterns (e.g. 30-50, FTL)
         weight_pattern = re.compile(r'^(\d+-\d+|\d+\s*-\s*\d+|>\s*\d+|FTL|1/2\s*FTL)', re.IGNORECASE)
         matched_weight_cols = []
@@ -303,28 +307,31 @@ def select_rate_card_fields(file_path: str) -> str:
         # Preserve original Excel order for weight columns
         ordered_weight_cols = [c for c in cols if c in matched_weight_cols]
 
-        # Extract system_field_keys
-        system_field_keys = [
+        # Extract system_field_keys (for CURRENCY duplicate check)
+        system_field_keys_from_llm = {
             item["system_field_key"]
             for item in matched_cols
             if "system_field_key" in item
-        ]
+        }
 
-        # Combine system fields + weight slabs
-        final_fields = system_field_keys + ordered_weight_cols
-
-        # Build and store column mapping: system_field_key -> excel_column (for SAP upload)
+        # Build column_mapping for SAP upload (includes weight columns).
+        # Build column_mappings for display: system field mappings only (no weight brackets).
+        # Weight brackets returned separately so the agent can show one summary line.
+        column_mappings = []
         column_mapping = {}
         for item in matched_cols:
             if "system_field_key" in item and "excel_column" in item:
-                column_mapping[item["system_field_key"]] = item["excel_column"]
+                excel_col = item["excel_column"]
+                actual_col = _actual_column(excel_col)
+                column_mapping[item["system_field_key"]] = actual_col
+                column_mappings.append({
+                    "excel_column": actual_col,
+                    "system_field_key": item["system_field_key"],
+                })
         for col in ordered_weight_cols:
-            column_mapping[col] = col  # Weight bracket columns: key = Excel header
+            actual_col = _actual_column(col)
+            column_mapping[col] = actual_col  # Weight bracket columns: key = Excel header (stripped)
         # If Excel has a CURRENCY column, add it so SAP upload can resolve from mapping
-        for col in cols:
-            if str(col).strip().upper() in ("CURRENCY", "CURRENCY CODE", "CCY") and "CURRENCY" not in column_mapping:
-                column_mapping["CURRENCY"] = col
-                break
         session_id = get_session_id()
         # Remember both the column mapping and the Excel path for this session
         store_column_mapping(session_id, column_mapping)
@@ -334,8 +341,11 @@ def select_rate_card_fields(file_path: str) -> str:
             f"{len(column_mapping)} entries, path={file_path}"
         )
 
-        # Build response string
-        return json.dumps(final_fields)
+        # Return system mappings only in column_mappings; weight columns separately for one-line summary
+        return json.dumps({
+            "column_mappings": column_mappings,
+            "weight_columns": ordered_weight_cols,
+        })
 
     except Exception as e:
         logger.error(f"Field selection error: {e}")
