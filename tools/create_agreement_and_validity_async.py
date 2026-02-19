@@ -8,7 +8,7 @@ import re
 import threading
 
 from google.adk.tools import FunctionTool
-from utils.session_context import get_session_id
+from utils.session_context import get_session_id, get_charge_type
 
 from tools.create_freight_agreement import create_freight_agreement
 from tools.create_rate_table_validity import create_rate_table_validity
@@ -28,12 +28,13 @@ def _run_agreement_and_validity(
     end_date: str,
     currency: str,
     session_id: str,
+    charge_type: str | None = None,
 ) -> None:
     """Run create_freight_agreement then create_rate_table_validity (no output to user)."""
     desc_short = agreement_description[:50] + "..." if len(agreement_description) > 50 else agreement_description
     logger.info(
-        "[Background] Starting agreement and validity creation: session_id=%s, description=%s, %s to %s",
-        session_id, desc_short, start_date, end_date,
+        "[Background] Starting agreement and validity creation: session_id=%s, description=%s, %s to %s, charge_type=%s",
+        session_id, desc_short, start_date, end_date, charge_type,
     )
     try:
         create_freight_agreement(
@@ -42,6 +43,7 @@ def _run_agreement_and_validity(
             end_date=end_date,
             currency=currency,
             session_id=session_id,
+            charge_type=charge_type,
         )
         create_rate_table_validity(session_id=session_id)
     except Exception as e:
@@ -70,6 +72,7 @@ def create_agreement_and_validity_async(
     end_date: str,
     currency: str = "EUR",
     run_in_background: bool = False,
+    charge_type: str | None = None,
 ) -> str:
     """
     Create Freight Agreement and Rate Table Validity in SAP.
@@ -86,15 +89,22 @@ def create_agreement_and_validity_async(
         end_date: YYYY-MM-DD.
         currency: Optional, default EUR.
         run_in_background: If True, run in background and return short message without Agreement ID.
+        charge_type: SAP charge type code the user confirmed (e.g. Z_BASE_FRGHT_RF). REQUIRED:
+                     pass the exact code the user selected. If omitted, falls back to session-stored
+                     value (from confirm_charge_type), then default Z_BASE_FRGHT_RF.
 
     Returns:
         Sync: Full success message including Agreement ID, or error.
         Async: Short message that agreement was created and user can upload Excel.
     """
     session_id = get_session_id()
+    # Resolve charge_type: explicit param wins, else session (from confirm_charge_type), else None (create_freight_agreement will use its default)
+    effective_charge_type = (charge_type or "").strip() if charge_type else None
+    if not effective_charge_type:
+        effective_charge_type = get_charge_type(session_id)
     logger.info(
-        "create_agreement_and_validity_async: session_id=%s, start=%s, end=%s, run_in_background=%s",
-        session_id, start_date, end_date, run_in_background,
+        "create_agreement_and_validity_async: session_id=%s, start=%s, end=%s, run_in_background=%s, charge_type=%s",
+        session_id, start_date, end_date, run_in_background, effective_charge_type,
     )
 
     if run_in_background:
@@ -106,6 +116,7 @@ def create_agreement_and_validity_async(
                 "end_date": end_date,
                 "currency": currency,
                 "session_id": session_id,
+                "charge_type": effective_charge_type,
             },
             daemon=True,
         )
@@ -120,6 +131,7 @@ def create_agreement_and_validity_async(
             end_date=end_date,
             currency=currency,
             session_id=session_id,
+            charge_type=effective_charge_type,
         )
         if result_fa.strip().lower().startswith("error"):
             return result_fa

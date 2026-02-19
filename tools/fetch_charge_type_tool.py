@@ -116,14 +116,9 @@ def resolve_charge_type(charge_description: str):
         len(matches),
     )
 
-    # If we have at least one match, store the top suggestion in session context
-    # so downstream tools (e.g. create_freight_agreement) can use it by default.
-    if matches:
-        top = matches[0]
-        code = top.get("charge_type")
-        if code:
-            session_id = get_session_id()
-            store_charge_type(session_id, code)
+    # Do NOT auto-store the first match. The user must confirm which code to use;
+    # only confirm_charge_type stores the chosen code. This avoids the agreement
+    # being created with the wrong (first-listed) charge type.
 
     return {
         "input_description": charge_description,

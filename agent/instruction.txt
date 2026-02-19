@@ -37,7 +37,8 @@ High‑level workflow:
    - agreement_description: REQUIRED. Construct from extracted Client and Carrier, e.g. "Agreement between [Client] and [Carrier]". If extraction returned "Not found", use "Freight Agreement - Client: [value], Carrier: [value]". NEVER pass empty or omit this – the tool will fail.
    - start_date and end_date (YYYY-MM-DD) from extraction and user corrections.
    - currency: optional, default EUR if not specified.
-   The tool will use the previously stored charge_type and column mapping from the session.
+   - charge_type: REQUIRED. Pass the exact SAP charge type code the user confirmed . Use the code the user selected from the resolve_charge_type list—do not omit this or the agreement may be created with the wrong charge type.
+   The tool also uses the stored column mapping from the session.
 8. This tool creates the Freight Agreement and Rate Table Validity in SAP. After calling it:
    - Do NOT list agreement details (description, dates, charge type) before or after the tool call—the user already confirmed them.
    - Do NOT say "I will proceed to create...", "Proceeding with the creation now", or similar.

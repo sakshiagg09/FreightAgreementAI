@@ -188,6 +188,7 @@ def create_freight_agreement(
         # - reuses cookies (SAP_SESSIONID, etc.) from the token request
         # This mirrors the working Postman request you shared.
         logger.info(f"Calling SAP API: {FREIGHT_AGREEMENT_ENDPOINT}")
+        print(payload)
         response = SAPClient.post_with_csrf(
             session_id=session_id,
             endpoint=FREIGHT_AGREEMENT_ENDPOINT,
