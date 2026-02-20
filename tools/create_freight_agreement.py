@@ -103,6 +103,7 @@ def create_freight_agreement(
     source_calc_base = _pick_calc_base(source_candidates, "SOURCELOC_ZONE")
     dest_calc_base = _pick_calc_base(dest_candidates, "DESTLOC_ZONE")
     weight_calc_base = _pick_calc_base(weight_candidates, "GROSS_WEIGHT")
+    service_calc_base = _pick_calc_base(weight_candidates, "SERVICE_CODE")
 
     logger.info(
         "Using TransportationCalculationBase values from column_mapping: "
@@ -161,6 +162,12 @@ def create_freight_agreement(
                                                 "TransportationCalculationBase": weight_calc_base,
                                                 "TranspRateTblScaleRefScaleType": "B",
                                                 "TranspRateTblScaleRefQtyUnit": "KG",
+                                                "TranspRateTblScaleRefCalcType": "A",
+                                            },
+                                            {
+                                                "TranspRateTableDimensionIndex": "4",
+                                                "TransportationCalculationBase": service_calc_base,
+                                                "TranspRateTblScaleRefScaleType": "X",
                                                 "TranspRateTblScaleRefCalcType": "A",
                                             },
                                         ],

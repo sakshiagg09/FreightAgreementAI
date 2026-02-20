@@ -61,7 +61,7 @@ def _rates_collection_path(validity_uuid: str) -> str:
     return f"TranspRateTableValidity(TranspRateTableValidityUUID={u})/_TranspRateTableRate"
 
 # Single batch for all entries so SAP shows 1 row per lane (not 1 row per chunk).
-BATCH_CHUNK_SIZE = 210
+BATCH_CHUNK_SIZE = 620
 DELETE_BATCH_CHUNK_SIZE = 25
 BATCH_MAX_RETRIES = 3
 BATCH_RETRY_DELAY_SEC = 2
@@ -259,6 +259,113 @@ def _resolve_column_by_description(column_mapping: dict, description_substrings:
             return excel_column
 
     return None
+
+
+# -------------------------------------------------------
+# Resolve CalcBase system field keys from session column mapping
+# Uses field mappings from select_rate_card_fields so different Excel
+# layouts (e.g. different origin/dest/weight column names) map correctly.
+# Description-based: any Excel column that the LLM mapped to an origin/dest/weight
+# system field will be used. Supports more than 3 dimensions (e.g. lane, service, days).
+# -------------------------------------------------------
+# Description substrings per dimension role (order defines dimension order).
+# Each tuple: (description_substrings, default_key_if_not_found).
+_CALC_BASE_DIMENSION_ROLES: list[tuple[tuple[str, ...], str]] = [
+    (
+        ("source", "origin", "departure", "ship from", "pickup", "port of loading", "transportation zone of source"),
+        "SOURCELOC_ZONE",
+    ),
+    (
+        ("destination", "dest", "arrival", "ship to", "delivery", "port of discharge", "transportation zone of destination"),
+        "DESTLOC_ZONE",
+    ),
+    (
+        ("gross weight", "weight", "chargeable weight", "net weight", "calculation weight", "dimensional weight", "scale"),
+        "GROSS_WEIGHT",
+    ),
+    (
+        ("lane", "transportation lane"),
+        "LANE",
+    ),
+    (
+        ("service type", "service code", "service level"),
+        "SERVICE_CODE",
+    ),
+    (
+        ("days", "no. of days", "lead time", "transit"),
+        "DAYS",
+    ),
+]
+# SAP typically supports a limited number of scale dimensions (e.g. 10)
+MAX_CALC_BASE_DIMENSIONS = 10
+
+
+def _resolve_calc_base_keys_from_mapping(column_mapping: dict) -> list[str]:
+    """
+    Resolve TransportationCalcBase01, 02, ... NN system field keys from the
+    session column mapping (from select_rate_card_fields). First three dimensions
+    are always origin, destination, weight (by description). Dimensions 4+ are
+    **all remaining** system field keys from the mapping (in mapping order), so
+    every mapped Excel column is used, not only a fixed set of roles.
+
+    Returns:
+        List of calc base keys, e.g. [SOURCELOC_ZONE, DESTLOC_ZONE, GROSS_WEIGHT]
+        or [..., LANE, SERVICE_CODE, DAYS, ...] for all system fields in the mapping.
+    """
+    if not column_mapping:
+        return [
+            _CALC_BASE_DIMENSION_ROLES[0][1],
+            _CALC_BASE_DIMENSION_ROLES[1][1],
+            _CALC_BASE_DIMENSION_ROLES[2][1],
+        ]
+
+    # Only keys that are known system fields (exclude weight-bracket column names like "30-50")
+    system_keys_in_mapping = [
+        k for k in column_mapping
+        if k in SYSTEM_FIELD_MAPPING
+    ]
+
+    def by_description(
+        keys: list[str],
+        description_substrings: tuple[str, ...],
+        default: str,
+        exclude: set[str] | None = None,
+    ) -> str:
+        """First key in keys whose SYSTEM_FIELD_MAPPING description matches any substring."""
+        exclude = exclude or set()
+        lowered = [s.lower() for s in description_substrings]
+        for key in keys:
+            if key in exclude:
+                continue
+            entry = SYSTEM_FIELD_MAPPING.get(key)
+            if not entry:
+                continue
+            _, desc = entry
+            desc_lower = (desc or "").lower()
+            if any(sub in desc_lower for sub in lowered):
+                return key
+        return default
+
+    # 1) Resolve first three dimensions by role (origin, dest, weight)
+    used: set[str] = set()
+    result: list[str] = []
+    for (descriptions, default) in _CALC_BASE_DIMENSION_ROLES[:3]:
+        key = by_description(system_keys_in_mapping, descriptions, default, exclude=used)
+        result.append(key)
+        used.add(key)
+
+    # 2) Add ALL other system keys from the mapping as dimensions 4+ (in column_mapping order)
+    for k in column_mapping:
+        if k not in SYSTEM_FIELD_MAPPING:
+            continue
+        if k in used:
+            continue
+        if len(result) >= MAX_CALC_BASE_DIMENSIONS:
+            break
+        result.append(k)
+        used.add(k)
+
+    return result
 
 
 # -------------------------------------------------------
@@ -717,72 +824,104 @@ def batch_upload_to_sap(
             },
         )
 
+        # Resolve CalcBase dimension keys from session field mapping (from select_rate_card_fields)
+        # First 3 = origin, dest, weight; 4+ = all other system fields in the mapping (in order)
+        calc_base_keys = _resolve_calc_base_keys_from_mapping(column_mapping or {})
+        num_dimensions = len(calc_base_keys)
+        logger.info(
+            "Using CalcBase keys from session mapping.",
+            extra={
+                "num_dimensions": num_dimensions,
+                "calc_base_keys": calc_base_keys,
+            },
+        )
+
+        # Excel columns for extra dimensions (index 3+); dimensions 0,1,2 use origin_col, dest_col, weight
+        extra_dimension_columns: list[str] = []
+        for key in calc_base_keys[3:]:
+            col = (column_mapping or {}).get(key)
+            if col and isinstance(col, str):
+                extra_dimension_columns.append(col)
+            else:
+                extra_dimension_columns.append("")
+
         all_entries = []
-        # Track unique entries to avoid creating duplicate entities in SAP
         seen_entry_keys: set[tuple] = set()
 
-        def _add_sap_entry(origin, destination, weight_value, rate_amount, currency):
+        def _normalize_scale_value(idx: int, value) -> str:
+            """Format scale value for SAP: zone normalization for 0,1; weight for 2; else str."""
+            if value is None or (isinstance(value, float) and pd.isna(value)):
+                return ""
+            s = str(value).strip()
+            if idx == 0 or idx == 1:
+                return _normalize_zone(s)
+            if idx == 2:
+                try:
+                    return format_gross_weight_for_sap(float(value))
+                except (TypeError, ValueError):
+                    return s
+            return s
+
+        def _add_sap_entry(scale_values: list, rate_amount, currency: str):
             """
-            Add a single SAP rate entry, de-duplicating by (origin, destination, weight).
-            Only one rate per (origin, dest, weight) is sent; we keep the first amount seen.
-            Never add entries with zero or negative amount (avoids "AT AT 0 0" duplicate rows).
-            Origin/destination are normalized (strip + upper) so duplicates are caught.
+            Add a single SAP rate entry. scale_values length must match calc_base_keys.
+            De-duplicates by tuple(scale_values). Skips zero/invalid amount.
             """
             parsed = _parse_amount(rate_amount)
             if parsed is None:
                 logger.debug(
                     "Skipping entry with zero/invalid amount; not sent to SAP.",
-                    extra={"origin": origin, "destination": destination, "weight": weight_value},
+                    extra={"scale_values": scale_values},
+                )
+                return
+
+            if len(scale_values) != num_dimensions:
+                logger.warning(
+                    "Scale values length %s does not match num_dimensions %s; skipping entry.",
+                    len(scale_values),
+                    num_dimensions,
+                    extra={"scale_values": scale_values},
                 )
                 return
 
             normalized_amount = round(parsed, 6)
-            norm_origin = _normalize_zone(origin)
-            norm_dest = _normalize_zone(destination)
-            if not norm_origin or not norm_dest:
+            normalized_currency = (currency or "EUR").strip() or "EUR"
+            normalized_scale = [_normalize_scale_value(i, v) for i, v in enumerate(scale_values)]
+
+            if not normalized_scale[0] or not normalized_scale[1]:
                 logger.debug(
                     "Skipping entry with blank origin/destination.",
-                    extra={"origin": origin, "destination": destination},
+                    extra={"scale_values": scale_values},
                 )
                 return
 
-            normalized_currency = (currency or "EUR").strip() or "EUR"
-            normalized_weight = format_gross_weight_for_sap(float(weight_value))
-
-            # One entity per (origin, dest, weight) — normalized so "AT"/"at"/"AT " are same
-            entry_key = (norm_origin, norm_dest, normalized_weight)
-
+            entry_key = tuple(normalized_scale)
             if entry_key in seen_entry_keys:
                 logger.debug(
-                    "Skipping duplicate (origin, dest, weight); keeping first rate.",
-                    extra={
-                        "origin": norm_origin,
-                        "destination": norm_dest,
-                        "weight": weight_value,
-                        "amount": rate_amount,
-                    },
+                    "Skipping duplicate scale combination; keeping first rate.",
+                    extra={"scale_values": normalized_scale, "amount": rate_amount},
                 )
                 return
-
             seen_entry_keys.add(entry_key)
 
             sap_entry = {
-                "TransportationCalcBase01": "SOURCELOC_ZONE",
-                "TransportationCalcBase02": "DESTLOC_ZONE",
-                "TransportationCalcBase03": "GROSS_WEIGHT",
                 "TransportationRateCurrency": normalized_currency,
                 "TransportationRateAmount": normalized_amount,
-                "TranspRateTableDimensionIndex": "3",
-                "TransportationScaleItem01Value": norm_origin,
-                "TransportationScaleItem02Value": norm_dest,
-                "TransportationScaleItem03Value": normalized_weight,
+                "TranspRateTableDimensionIndex": str(num_dimensions),
             }
+            for i in range(num_dimensions):
+                sap_entry[f"TransportationCalcBase{i + 1:02d}"] = calc_base_keys[i]
+                sap_entry[f"TransportationScaleItem{i + 1:02d}Value"] = normalized_scale[i]
 
+            # sap_entry holds all dimensions for SAP (sent as-is). We also store:
+            # - scale_values: full list of all dimension values (for consistency / logging).
+            # - origin, destination, weight: used by summary, unique_lanes, unique_weights, and max_weight_breaks filter.
             all_entries.append({
                 "sap_entry": sap_entry,
-                "origin": norm_origin,
-                "destination": norm_dest,
-                "weight": weight_value,
+                "scale_values": normalized_scale,
+                "origin": normalized_scale[0],
+                "destination": normalized_scale[1],
+                "weight": normalized_scale[2] if num_dimensions > 2 else None,
                 "amount": normalized_amount,
                 "currency": normalized_currency,
             })
@@ -790,9 +929,8 @@ def batch_upload_to_sap(
             logger.debug(
                 "Prepared SAP rate entry.",
                 extra={
-                    "origin": norm_origin,
-                    "destination": norm_dest,
-                    "weight": weight_value,
+                    "num_dimensions": num_dimensions,
+                    "scale_values": normalized_scale,
                     "amount": normalized_amount,
                     "currency": normalized_currency,
                 },
@@ -840,10 +978,10 @@ def batch_upload_to_sap(
 
             for _, row in df.iterrows():
                 try:
-                    origin = _normalize_zone(row.get(origin_col, ""))
-                    destination = _normalize_zone(row.get(dest_col, ""))
+                    origin = row.get(origin_col, "")
+                    destination = row.get(dest_col, "")
 
-                    if not origin or not destination:
+                    if not _normalize_zone(origin) or not _normalize_zone(destination):
                         continue
 
                     rate_amount = _parse_amount(row.get(amount_col_long))
@@ -863,7 +1001,13 @@ def batch_upload_to_sap(
                         else "EUR"
                     )
 
-                    _add_sap_entry(origin, destination, weight_value, rate_amount, currency)
+                    scale_values = [origin, destination, weight_value]
+                    for col in extra_dimension_columns:
+                        if col and col in df.columns:
+                            scale_values.append(row.get(col, ""))
+                        else:
+                            scale_values.append("")
+                    _add_sap_entry(scale_values, rate_amount, currency)
 
                 except Exception as row_exc:
                     logger.debug(
@@ -1022,6 +1166,13 @@ def batch_upload_to_sap(
                             )
                             continue
 
+                        scale_values = [origin, destination, weight_value]
+                        for col in extra_dimension_columns:
+                            if col and col in df.columns:
+                                scale_values.append(row.get(col, ""))
+                            else:
+                                scale_values.append("")
+
                         logger.debug(
                             "Adding SAP rate entry (wide format).",
                             extra={
@@ -1034,7 +1185,7 @@ def batch_upload_to_sap(
                             },
                         )
 
-                        _add_sap_entry(origin, destination, weight_value, rate_amount, currency)
+                        _add_sap_entry(scale_values, rate_amount, currency)
 
                 except Exception as row_exc:
                     logger.debug(
@@ -1051,13 +1202,22 @@ def batch_upload_to_sap(
             return "Error: No valid rate entries found."
 
         # -------------------------------------------------------
-        # Final pass: keep exactly one entry per (origin, dest, weight), no zeros.
-        # Ensures we never send duplicates or "AT AT 0 0" even if something slipped through.
+        # Final pass: keep exactly one entry per full scale combination (all dimensions), no zeros.
+        # Dedupe by all TransportationScaleItem*Value so 6-dimension entries (e.g. + SERVICE_CODE, DAYS, LANE) are not collapsed.
         # -------------------------------------------------------
-        final_keys: set[tuple[str, str, str]] = set()
+        def _entry_scale_key(entry: dict) -> tuple:
+            """Full dimension key from sap_entry so all columns from column mapping are respected."""
+            sap = entry.get("sap_entry") or {}
+            n = int(sap.get("TranspRateTableDimensionIndex", "3"))
+            return tuple(
+                sap.get(f"TransportationScaleItem{i + 1:02d}Value", "")
+                for i in range(n)
+            )
+
+        final_keys: set[tuple] = set()
         filtered: list[dict] = []
         for e in all_entries:
-            key = (e["origin"], e["destination"], format_gross_weight_for_sap(float(e["weight"])))
+            key = _entry_scale_key(e)
             if key in final_keys:
                 continue
             amt = e.get("amount") or e["sap_entry"].get("TransportationRateAmount")
@@ -1068,7 +1228,7 @@ def batch_upload_to_sap(
         dropped = len(all_entries) - len(filtered)
         if dropped:
             logger.warning(
-                "Dropped %s duplicate or zero-amount entries before sending; sending only unique (origin, dest, weight) with positive amount.",
+                "Dropped %s duplicate or zero-amount entries before sending; sending only unique full scale combinations with positive amount.",
                 dropped,
                 extra={"before": len(all_entries), "after": len(filtered)},
             )
@@ -1082,11 +1242,10 @@ def batch_upload_to_sap(
             return "Error: No valid rate entries found after de-duplication."
 
         # -------------------------------------------------------
-        # Sort by weight, then origin, then destination so SAP sees
-        # scale values in ascending order (50, 75, 100, ...). This
-        # can help systems that create or assign scale items by order.
+        # Sort by full scale key (all dimensions) so order is deterministic and SAP sees
+        # scale values in a consistent order (e.g. origin, dest, weight, service, days, lane).
         # -------------------------------------------------------
-        all_entries.sort(key=lambda e: (float(e["weight"]), e["origin"], e["destination"]))
+        all_entries.sort(key=lambda e: _entry_scale_key(e))
 
         # -------------------------------------------------------
         # Optional: limit weight breaks. Default: no limit (upload all weights from Excel).
@@ -1108,9 +1267,9 @@ def batch_upload_to_sap(
             extra={"max_weight_breaks_param": max_weight_breaks, "SAP_MAX_WEIGHT_BREAKS_env": os.environ.get("SAP_MAX_WEIGHT_BREAKS"), "resolved_max_breaks": max_breaks},
         )
         if max_breaks and max_breaks > 0:
-            unique_weights_ordered = sorted(set(e["weight"] for e in all_entries))
+            unique_weights_ordered = sorted(set(e.get("weight") for e in all_entries if e.get("weight") is not None))
             allowed_weights = set(unique_weights_ordered[:max_breaks])
-            all_entries = [e for e in all_entries if e["weight"] in allowed_weights]
+            all_entries = [e for e in all_entries if e.get("weight") in allowed_weights]
             logger.info(
                 f"{SAP_UPLOAD_LOG_PREFIX} Limited to first %s weight breaks to match curl display.",
                 max_breaks,
@@ -1121,7 +1280,7 @@ def batch_upload_to_sap(
         # Summary: (origin, dest, weight) counts for verification
         # -------------------------------------------------------
         unique_lanes = set((e["origin"], e["destination"]) for e in all_entries)
-        unique_weights = set(e["weight"] for e in all_entries)
+        unique_weights = set(e.get("weight") for e in all_entries if e.get("weight") is not None)
         weight_breaks_sorted = sorted(unique_weights)
         summary = {
             "total_rate_rows": len(all_entries),
