@@ -2,13 +2,17 @@
 Logistics Agent - ADK-based agent for freight agreement and rate card workflows.
 """
 
+import logging
 from pathlib import Path
 
 from google.adk import Runner
 from google.adk.agents import LlmAgent
 from google.adk.sessions import InMemorySessionService
 
+logger = logging.getLogger(__name__)
+
 from .azure_openai_llm import AzureOpenAILlm
+from .callbacks import before_model_callback, after_model_callback
 from config.dev_config import AZURE_OPENAI_CHAT_URL, AZURE_OPENAI_API_KEY, AZURE_OPENAI_DEPLOYMENT
 from tools.create_agreement_and_validity_async import create_agreement_and_validity_async_tool
 from tools.sap_upload_tool import sap_upload_tool
@@ -45,7 +49,12 @@ logistics_agent = LlmAgent(
         field_selection_tool,
         create_agreement_and_validity_async_tool,
         sap_upload_tool,
-    ]
+    ],
+    before_model_callback=before_model_callback,
+    after_model_callback=after_model_callback,
 )
 
 runner = Runner(agent=logistics_agent, session_service=session_service, app_name="LogisticsApp")
+logger.info(
+    "LogisticsAgent initialized with before_model_callback and after_model_callback app_name=LogisticsApp"
+)

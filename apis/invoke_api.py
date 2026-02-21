@@ -9,10 +9,6 @@ from utils.session_context import set_session_id, get_agreement_id, get_agreemen
 from utils.llm_usage import reset_llm_usage, get_llm_usage
 from config.dev_config import TEMP_UPLOADS_DIR, APP_NAME, DEFAULT_USER_ID
 
-# Import Phoenix tracing
-from utils.phoenix_tracing import AgentTracer, get_tracer
-from opentelemetry.trace import get_current_span, Status, StatusCode
-
 logger = logging.getLogger(__name__)
 
 # Define the router for the logistics API
@@ -66,120 +62,41 @@ async def invoke(
     if not actual_message:
         actual_message = "Hello"
 
-    # Trace the API invocation itself - use context manager properly
-    tracer = get_tracer()
     final_response = ""
-    
-    if tracer:
-        # Create a span for the API invocation - this replaces the "invocation" unknown span
-        with tracer.start_as_current_span(
-            "spa_upload.api.invoke",
-            openinference_span_kind="chain",
-        ) as api_span_context:
-            api_span = get_current_span()
-            if api_span and api_span.is_recording():
-                api_span.set_attribute("openinference.span.kind", "CHAIN")
-                api_span.set_attribute("name", "spa_upload.api.invoke")
-                api_span.set_attribute("display_name", "API Invoke")
-                api_span.set_attribute("input.value", f"session_id={session_id}, message={actual_message}")
-            
-            try:
-                # Set session context for tools to access
-                set_session_id(session_id)
-                reset_llm_usage(session_id)
+    try:
+        set_session_id(session_id)
+        reset_llm_usage(session_id)
 
-                # Get or create session
-                session = await session_service.get_session(app_name=APP_NAME, user_id=user_id, session_id=session_id)
-                if not session:
-                    await session_service.create_session(app_name=APP_NAME, user_id=user_id, session_id=session_id)
+        session = await session_service.get_session(app_name=APP_NAME, user_id=user_id, session_id=session_id)
+        if not session:
+            await session_service.create_session(app_name=APP_NAME, user_id=user_id, session_id=session_id)
 
-                # Wrap message for ADK Runner
-                user_message = types.Content(role="user", parts=[types.Part.from_text(text=actual_message)])
-                
-                # Run agent with Phoenix tracing - use clear agent name
-                with AgentTracer(agent_type="LogisticsAgent") as agent_tracer:
-                    # Set input for agent span
-                    agent_tracer.set_input(f"session_id={session_id}, message={actual_message}")
-                    
-                    events = runner.run(user_id=user_id, session_id=session_id, new_message=user_message)
-                    
-                    # Collect response
-                    for event in events:
-                        if hasattr(event, 'content') and hasattr(event.content, 'parts'):
-                            for part in event.content.parts:
-                                if hasattr(part, 'text') and part.text:
-                                    final_response += part.text
-                        elif hasattr(event, 'text'):
-                            final_response += event.text
-                    
-                    # Set output for agent span
-                    agent_tracer.set_output(final_response or "I'm ready to help. Please provide the document.")
-                
-                # Set output and status for API span - MUST be set before context exits
-                if api_span and api_span.is_recording():
-                    api_span.set_attribute("output.value", final_response or "I'm ready to help. Please provide the document.")
-                    api_span.set_status(Status(StatusCode.OK))
+        user_message = types.Content(role="user", parts=[types.Part.from_text(text=actual_message)])
+        events = runner.run(user_id=user_id, session_id=session_id, new_message=user_message)
 
-                usage = get_llm_usage(session_id)
-                out = {
-                    "session_id": session_id,
-                    "response": final_response or "I'm ready to help. Please provide the document.",
-                    "usage": usage,
-                }
-                agreement_id = get_agreement_id(session_id)
-                agreement_uuid = get_agreement_uuid(session_id)
-                if agreement_id is not None:
-                    out["agreement_id"] = agreement_id
-                if agreement_uuid is not None:
-                    out["agreement_uuid"] = agreement_uuid
-                return out
-            except Exception as e:
-                logger.error(f"Invoke API failed: {e}", exc_info=True)
-                # Set error status on API span - MUST be set before context exits
-                if api_span and api_span.is_recording():
-                    api_span.record_exception(e)
-                    api_span.set_status(Status(StatusCode.ERROR))
-                return {"error": str(e)}
-    else:
-        # No tracer available - execute without tracing
-        try:
-            set_session_id(session_id)
-            reset_llm_usage(session_id)
-            session = await session_service.get_session(app_name=APP_NAME, user_id=user_id, session_id=session_id)
-            if not session:
-                await session_service.create_session(app_name=APP_NAME, user_id=user_id, session_id=session_id)
+        for event in events:
+            if hasattr(event, 'content') and hasattr(event.content, 'parts'):
+                for part in event.content.parts:
+                    if hasattr(part, 'text') and part.text:
+                        final_response += part.text
+            elif hasattr(event, 'text'):
+                final_response += event.text
 
-            user_message = types.Content(role="user", parts=[types.Part.from_text(text=actual_message)])
-            
-            with AgentTracer(agent_type="LogisticsAgent") as agent_tracer:
-                agent_tracer.set_input(f"session_id={session_id}, message={actual_message}")
-                events = runner.run(user_id=user_id, session_id=session_id, new_message=user_message)
-                
-                for event in events:
-                    if hasattr(event, 'content') and hasattr(event.content, 'parts'):
-                        for part in event.content.parts:
-                            if hasattr(part, 'text') and part.text:
-                                final_response += part.text
-                    elif hasattr(event, 'text'):
-                        final_response += event.text
-                
-                agent_tracer.set_output(final_response or "I'm ready to help. Please provide the document.")
-
-            usage = get_llm_usage(session_id)
-            out = {
-                "session_id": session_id,
-                "response": final_response or "I'm ready to help. Please provide the document.",
-                "usage": usage,
-            }
-            agreement_id = get_agreement_id(session_id)
-            agreement_uuid = get_agreement_uuid(session_id)
-            if agreement_id is not None:
-                out["agreement_id"] = agreement_id
-            if agreement_uuid is not None:
-                out["agreement_uuid"] = agreement_uuid
-            return out
-        except Exception as e:
-            logger.error(f"Invoke API failed: {e}", exc_info=True)
-            return {"error": str(e)}
+        usage = get_llm_usage(session_id)
+        out = {
+            "session_id": session_id,
+            "response": final_response or "I'm ready to help. Please provide the document.",
+            "usage": usage,
+        }
+        agreement_id = get_agreement_id(session_id)
+        agreement_uuid = get_agreement_uuid(session_id)
+        if agreement_id is not None:
+            out["agreement_id"] = agreement_id
+        if agreement_uuid is not None:
+            out["agreement_uuid"] = agreement_uuid
+        return out
+    except Exception as e:
+        logger.error(f"Invoke API failed: {e}", exc_info=True)
+        return {"error": str(e)}
 
 
