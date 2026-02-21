@@ -13,7 +13,6 @@ from google.adk.models import BaseLlm, LlmResponse
 from google.genai import types
 
 from config.dev_config import OLLAMA_TIMEOUT, MAX_RETRIES, RETRY_DELAY
-from utils.phoenix_tracing import spa_upload_tracer
 from utils.llm_usage import add_llm_usage
 
 # -----------------------------------------------------------------------------
@@ -239,7 +238,6 @@ class AzureOpenAILlm(BaseLlm):
             errorMessage=str(error),
         )
 
-    @spa_upload_tracer.llm
     def generate_content(self, request: Any, **kwargs) -> LlmResponse:
         """Generate content via Azure OpenAI with tool calling support."""
         try:

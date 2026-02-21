@@ -13,10 +13,6 @@ from config.dev_config import (
     AZURE_OPENAI_DEPLOYMENT,
 )
 
-# Import Phoenix tracing
-from utils.phoenix_tracing import spa_upload_tracer
-from opentelemetry.trace import get_current_span, Status, StatusCode
-
 logger = logging.getLogger(__name__)
 
 # Extract field descriptions from SYSTEM_FIELD_MAPPING
@@ -39,22 +35,14 @@ def get_system_field_key_from_description(description: str) -> str | None:
     """
     return DESCRIPTION_TO_FIELD.get(description)
 
-@spa_upload_tracer.tool(name="select_rate_card_fields", description="Matches Excel rate card columns with DHL system field descriptions")
 def select_rate_card_fields(file_path: str) -> str:
     """Matches Excel columns with DHL field descriptions."""
     logger.info(f"Tool select_rate_card_fields called for: {file_path}")
 
-    # Get current span for tracing
-    span = get_current_span()
-
     try:
         # Validate file path
         if not file_path or not isinstance(file_path, str):
-            error_msg = "Error: Invalid file path provided."
-            if span and span.is_recording():
-                span.set_attribute("output.error", error_msg)
-                span.set_status(Status(StatusCode.ERROR, error_msg))
-            return error_msg
+            return "Error: Invalid file path provided."
 
         # Normalize file path (handle spaces and special characters)
         file_path = os.path.abspath(os.path.expanduser(file_path))
@@ -63,9 +51,6 @@ def select_rate_card_fields(file_path: str) -> str:
         if not os.path.exists(file_path):
             error_msg = f"Error: File not found at path: {file_path}"
             logger.error(error_msg)
-            if span and span.is_recording():
-                span.set_attribute("output.error", error_msg)
-                span.set_status(Status(StatusCode.ERROR, error_msg))
             return error_msg
 
         # Validate file extension
@@ -76,9 +61,6 @@ def select_rate_card_fields(file_path: str) -> str:
                 f"but received: {file_ext}. Please upload a valid Excel document."
             )
             logger.error(error_msg)
-            if span and span.is_recording():
-                span.set_attribute("output.error", error_msg)
-                span.set_status(Status(StatusCode.ERROR, error_msg))
             return error_msg
 
         # Check file size (basic corruption check)
@@ -86,9 +68,6 @@ def select_rate_card_fields(file_path: str) -> str:
         if file_size == 0:
             error_msg = "Error: The uploaded file is empty or corrupted. Please upload a valid Excel file."
             logger.error(error_msg)
-            if span and span.is_recording():
-                span.set_attribute("output.error", error_msg)
-                span.set_status(Status(StatusCode.ERROR, error_msg))
             return error_msg
 
         # Check for problematic characters in filename (log warning but proceed)
@@ -96,13 +75,6 @@ def select_rate_card_fields(file_path: str) -> str:
         problematic_chars = ['<', '>', ':', '"', '|', '?', '*']
         if any(char in filename for char in problematic_chars):
             logger.warning(f"Filename contains special characters that may cause issues: {filename}")
-
-        # Trace: Log file validation
-        if span and span.is_recording():
-            span.set_attribute("input.file_path", file_path)
-            span.set_attribute("input.file_size", file_size)
-            span.set_attribute("input.file_extension", file_ext)
-            span.set_attribute("input.filename", filename)
 
         # Load Excel with better error handling.
         # We treat the **third physical row in Excel (index 2)** as the header row,
@@ -136,11 +108,6 @@ def select_rate_card_fields(file_path: str) -> str:
                     "Please verify the file is a valid Excel document (.xls or .xlsx) and not corrupted."
                 )
 
-            if span and span.is_recording():
-                span.set_attribute("output.error", error_msg)
-                span.set_attribute("output.error_type", error_type)
-                span.set_status(Status(StatusCode.ERROR, error_msg))
-
             return error_msg
 
         # Extract cleaned column names, ignoring empty, 'Unnamed', and 'nan' headers
@@ -152,22 +119,11 @@ def select_rate_card_fields(file_path: str) -> str:
                and str(c).lower() != "nan"
         ]
 
-        # Trace: Log input parameters
-        if span and span.is_recording():
-            span.set_attribute("input.file_path", file_path)
-            span.set_attribute("input.total_columns", len(cols))
-            span.set_attribute("input.columns", json.dumps(cols[:50]))  # First 50 columns
-            span.set_attribute("input.field_descriptions_count", len(FIELD_DESCRIPTIONS))
-            span.set_attribute("input.field_descriptions_sample", json.dumps(FIELD_DESCRIPTIONS[:20]))  # First 20 descriptions
-
         logger.info(f"Found {len(cols)} columns in Excel file")
         logger.debug(f"FIELD_DESCRIPTIONS count: {len(FIELD_DESCRIPTIONS)}")
         logger.debug(f"Sample FIELD_DESCRIPTIONS: {FIELD_DESCRIPTIONS[:10]}")
 
         if not cols:
-            if span and span.is_recording():
-                span.set_attribute("output.error", "No valid columns found")
-                span.set_status(Status(StatusCode.ERROR, "No valid columns found"))
             return "Error: No valid columns found in the Excel file. Please check the file format."
 
         def _actual_column(col_name: str) -> str:

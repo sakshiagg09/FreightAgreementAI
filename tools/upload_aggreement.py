@@ -10,9 +10,6 @@ from config.dev_config import (
     AZURE_OPENAI_API_KEY,
 )
 
-# Import Phoenix tracing
-from utils.phoenix_tracing import spa_upload_tracer
-
 logger = logging.getLogger(__name__)
 
 def calculate_end_date(start_date_str, no_of_years_str):
@@ -26,7 +23,6 @@ def calculate_end_date(start_date_str, no_of_years_str):
     except Exception:
         return None
 
-@spa_upload_tracer.tool(name="extract_agreement_info", description="Extracts client, carrier, start_date, and no_of_years from a PDF agreement file path")
 def extract_agreement_info(file_path: str) -> str:
     """Extracts client, carrier, start_date, and no_of_years from a PDF agreement file path."""
     logger.info(f"Tool extract_agreement_info called for: {file_path}")
