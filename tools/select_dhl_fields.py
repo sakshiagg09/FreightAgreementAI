@@ -12,7 +12,7 @@ import requests
 from google.adk.tools import FunctionTool
 from utils.system_field_mapping import SYSTEM_FIELD_MAPPING
 from utils.excel_semantic_embedding import match_labels_to_system_fields
-from utils.session_context import get_session_id, store_column_mapping, store_excel_header_row, store_rate_card_path
+from utils.session_context import get_session_id, store_column_mapping, store_excel_header_row, store_rate_card_path, store_field_selection_result
 
 # Import Phoenix tracing
 from utils.phoenix_tracing import spa_upload_tracer
@@ -64,28 +64,40 @@ HEADER_WINDOW_ROWS = 4
 HEADER_ROW_FOR_DOWNSTREAM = 2
 
 # Minimum cosine similarity to accept a label -> system field match
-SIMILARITY_THRESHOLD = 0.40
+SIMILARITY_THRESHOLD = 0.45
 
 # Minimum matches from merged strategy to prefer it over flat cell matching
 MIN_MERGED_MATCHES_TO_PREFER = 2
 
-# Keywords used to derive "anchor" system fields from SYSTEM_FIELD_MAPPING descriptions.
-# Any system field whose description contains (case-insensitive) one of these is treated
-# as a rate-table header anchor when detecting "header far down". No field names hardcoded.
-_ANCHOR_DESCRIPTION_KEYWORDS = (
-    "origin", "destination", "source", "location", "country", "zone",
-    "postal", "city", "weight", "charge", "goods value", "fuel surcharge",
-    "lane", "service", "carrier", "airport",
-)
+# Max length for a single header label; longer text is treated as heading/paragraph and excluded
+MAX_HEADER_LABEL_LENGTH = 80
+
+# Characters that indicate a bullet or note line (not a column header). Strip and check start of text.
+_BULLET_NOTE_PREFIXES = ("■", "•", "▪", "‣", "◦", "►", "●", "○")
+
+def _is_too_long_for_header(text: str) -> bool:
+    """True if text is empty or longer than typical column header length (exclude from matching)."""
+    if not text or not text.strip():
+        return True
+    return len(text.strip()) > MAX_HEADER_LABEL_LENGTH
 
 
-def _get_anchor_system_fields() -> frozenset[str]:
-    """Build anchor set from SYSTEM_FIELD_MAPPING: keys whose description contains any keyword."""
-    keywords = _ANCHOR_DESCRIPTION_KEYWORDS
-    return frozenset(
-        k for k, (_scale_base, desc) in SYSTEM_FIELD_MAPPING.items()
-        if desc and any(kw in desc.lower() for kw in keywords)
-    )
+def _is_note_or_bullet_label(text: str) -> bool:
+    """True if text looks like a bullet point or note line (e.g. '■ VAT exclusive'), not a column header."""
+    if not text or not text.strip():
+        return False
+    s = text.strip()
+    if s.startswith(_BULLET_NOTE_PREFIXES):
+        return True
+    # Common list-style bullet prefixes (e.g. "- Note text", "* Item")
+    if re.match(r"^[\-\*]\s+", s):
+        return True
+    return False
+
+
+def _should_exclude_label(text: str) -> bool:
+    """True if label should be excluded from column matching (too long, or bullet/note line)."""
+    return _is_too_long_for_header(text) or _is_note_or_bullet_label(text)
 
 
 def _get_exclude_heading_substrings() -> tuple[str, ...]:
@@ -125,12 +137,25 @@ def _llm_detect_heading_labels(matched_fields: list[dict]) -> set[str]:
         return set()
     labels_list = [m["excel_column"] for m in matched_fields]
     prompt = (
-        "You are given a list of Excel column labels that were matched to system fields for a freight rate card. "
-        "Some labels are document or section headings (e.g. sheet title, subtitle like 'Rate per loaded kilometre...', "
-        "'Carrier name: X', section headers) and should NOT be treated as data column headers. "
-        "Return ONLY a JSON array of the exact column labels that are headings (to be excluded from the mapping). "
-        "Use the exact text as shown. If none are headings, return []. No explanation.\n\n"
-        "Labels:\n"
+        "You are classifying Excel labels from a freight rate card. Some labels are real DATA COLUMN HEADERS "
+        "(should be kept); others are DOCUMENT/SECTION TEXT and must be excluded (headings, subtitles, legal notes, "
+        "explanatory sentences).\n\n"
+        "EXCLUDE (return these in your JSON array) – do NOT treat as column headers:\n"
+        "- Bullet points or note lines (e.g. starting with ■ or •): '■ This price is inclusive of 60 minutes loading and 60 minutes unloading', "
+        "'■ VAT exclusive', '■ Minimum fuel surcharge is 0% which is the valid surcharge at the time of offer', '■ Payment terms: 30 days invoice reception date'.\n"
+        "- Sheet titles, subtitles, or section headers (e.g. 'Rate per loaded kilometre', 'Carrier name: X').\n"
+        "- Full sentences or explanatory text (e.g. 'Prices exclusive possible additional costs that may occur on a shipment level (see separate sheets)', "
+        "'Rates are excluding a fuel surcharge which is indexed on a weekly basis based on the weekly average fuel price', "
+        "'Payment terms: 30 days invoice reception date').\n"
+        "- Legal/contract wording, disclaimers, or notes that describe conditions rather than naming a single data field.\n"
+        "- Anything that reads like a paragraph or clause, contains colons followed by a full phrase, or mentions 'terms', 'excluding', 'see separate', 'based on', 'which is' in a sentence context.\n\n"
+        "KEEP (do NOT return these) – these ARE column headers:\n"
+        "- Short, specific field names (e.g. 'Origin Country', 'Destination Zone', 'Weight (kg)', 'Service Type', 'Transit Time', 'Lane ID', 'Chargeable Weight').\n"
+        "- Weight/slab labels (e.g. '0-50', '151-200', 'FTL', '> 20 001').\n"
+        "- Typically one to six words; clearly refer to a single column of data.\n\n"
+        "Return ONLY a JSON array of the EXACT label strings that are headings/sentences to EXCLUDE. "
+        "Use the exact text as shown below. If none should be excluded, return []. No other output.\n\n"
+        "Labels to classify:\n"
     )
     for i, label in enumerate(labels_list, 1):
         prompt += f"{i}. {json.dumps(label)}\n"
@@ -186,10 +211,9 @@ def _cell_text(val) -> str:
 
 def _detect_header_row(df: pd.DataFrame) -> int | None:
     """
-    Find the row that looks most like a rate table header by semantic match.
-    Prefers rows that contain "anchor" fields (origin, destination, weight, rate)
-    so we don't pick title text, unit-definition blocks, or footer (e.g. Roberts Europe).
-    Scans rows 0..MAX_SCAN_ROWS_FOR_HEADER; returns the best row index or None.
+    Find the row that looks most like a rate table header by semantic match count.
+    Scans rows 0..MAX_SCAN_ROWS_FOR_HEADER; returns the row with the most system-field
+    matches (>= MIN_HEADER_ROW_MATCHES). On tie, prefers the bottom-most row (header just above data).
     """
     if len(df) == 0 or len(df.columns) == 0:
         return None
@@ -197,21 +221,8 @@ def _detect_header_row(df: pd.DataFrame) -> int | None:
     max_c = min(MAX_HEADER_COLS, len(df.columns))
     max_cell_len_for_header = 80
 
-    # Priority 1: if any row has a cell containing ("origin" or "source") and "country"
-    # (e.g. "Origin country", "Source country"), return the last such row (rate table header).
-    for r in range(max_scan - 1, -1, -1):
-        for c in range(max_c):
-            t = _cell_text(df.iloc[r, c])
-            if t and len(t) <= 200:
-                lower = t.lower()
-                if ("origin" in lower or "source" in lower) and "country" in lower and "destination" not in lower:
-                    logger.info("Header row: row %d (cell contains origin/source and country).", r)
-                    return r
-
-    # Priority 2: semantic anchor-based detection
-    candidates_with_anchor: list[tuple[int, int]] = []
-    best_fallback_row: int | None = None
-    best_fallback_count = 0
+    best_row: int | None = None
+    best_count = 0
     for r in range(max_scan):
         texts = []
         for c in range(max_c):
@@ -223,20 +234,14 @@ def _detect_header_row(df: pd.DataFrame) -> int | None:
         matches = match_labels_to_system_fields(
             texts, similarity_threshold=SIMILARITY_THRESHOLD
         )
-        matched_keys = {sys_key for _idx, sys_key, _score in matches}
-        has_anchor = bool(matched_keys & _get_anchor_system_fields())
-        # Allow anchor rows with 1+ match so we catch "Origin country" row even if "Minimum"/"€/km" don't match
-        if has_anchor and len(matches) >= 1:
-            candidates_with_anchor.append((r, len(matches)))
-        if len(matches) >= MIN_HEADER_ROW_MATCHES and len(matches) > best_fallback_count:
-            best_fallback_count = len(matches)
-            best_fallback_row = r
-    if candidates_with_anchor:
-        # Prefer the bottom-most row that has an anchor (rate table header is usually
-        # the last header row, just above the data). Avoids picking title/unit block.
-        best_row, _ = max(candidates_with_anchor, key=lambda x: (x[0], x[1]))
-        return best_row
-    return best_fallback_row
+        num_matches = len(matches)
+        if num_matches >= MIN_HEADER_ROW_MATCHES and num_matches >= best_count:
+            # Prefer bottom-most row on tie (header usually just above data)
+            best_count = num_matches
+            best_row = r
+    if best_row is not None:
+        logger.info("Header row: row %d (%d semantic matches).", best_row, best_count)
+    return best_row
 
 
 def _extract_semantic_units(
@@ -259,7 +264,7 @@ def _extract_semantic_units(
             except Exception:
                 continue
             text = _cell_text(val)
-            if not text or len(text) > 200:  # skip empty and very long
+            if not text or _should_exclude_label(text):
                 continue
             units.append((r, c, text))
     return units
@@ -497,6 +502,7 @@ def select_rate_card_fields(file_path: str) -> str:
         merged_col_labels = _extract_merged_column_labels(
             df, MAX_MERGED_HEADER_ROWS, start_row=header_start
         )
+        merged_col_labels = [(c, label) for c, label in merged_col_labels if not _should_exclude_label(label)]
         merged_col_texts = [label for _c, label in merged_col_labels]
         merged_col_matches = match_labels_to_system_fields(
             merged_col_texts, similarity_threshold=SIMILARITY_THRESHOLD
@@ -504,6 +510,7 @@ def select_rate_card_fields(file_path: str) -> str:
 
         # --- Strategy 2: merged row labels (row-oriented layout) ---
         merged_row_labels = _extract_merged_row_labels(df, MAX_MERGED_HEADER_COLS)
+        merged_row_labels = [(r, label) for r, label in merged_row_labels if not _should_exclude_label(label)]
         merged_row_texts = [label for _r, label in merged_row_labels]
         merged_row_matches = match_labels_to_system_fields(
             merged_row_texts, similarity_threshold=SIMILARITY_THRESHOLD
@@ -576,7 +583,10 @@ def select_rate_card_fields(file_path: str) -> str:
             df, units, label_matches, layout, header_index, header_row_for_name
         )
 
-        # Exclude document/section headings: LLM detects automatically; fallback to config if LLM unavailable
+        # Exclude labels that are too long or bullet/note lines (safety net for merged labels)
+        matched_fields = [m for m in matched_fields if not _should_exclude_label(m["excel_column"])]
+
+        # Exclude document/section headings: LLM classifies headings vs column headers; fallback to config if LLM unavailable
         llm_exclude = _llm_detect_heading_labels(matched_fields)
         if llm_exclude:
             matched_fields = [m for m in matched_fields if m["excel_column"] not in llm_exclude]
@@ -649,6 +659,7 @@ def select_rate_card_fields(file_path: str) -> str:
             "column_mapping": mapping_display,
             "weight_columns": ordered_weight_cols,
         }
+        store_field_selection_result(session_id, response)
         return json.dumps(response, indent=2)
 
     except Exception as e:

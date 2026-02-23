@@ -5,7 +5,7 @@ Also stores UUIDs (Agreement UUID, Rate Table Validity UUID) per session
 """
 import contextvars
 import logging
-from typing import Optional, Dict
+from typing import Optional, Dict, Any
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +27,10 @@ _rate_card_path_storage: Dict[str, str] = {}
 
 # Session-level Excel header row (0-based) for "header far down" templates; None = use default (2)
 _excel_header_row_storage: Dict[str, Optional[int]] = {}
+
+# Full field selection result from select_rate_card_fields for structured API response:
+# session_id -> {"column_mapping": [...], "fields": [...], "weight_columns": [...]}
+_field_selection_result_storage: Dict[str, Dict[str, Any]] = {}
 
 def set_session_id(session_id: str):
     """Set the current session ID in context"""
@@ -169,6 +173,31 @@ def get_column_mapping(session_id: Optional[str] = None) -> Optional[Dict]:
     if session_id is None:
         session_id = get_session_id()
     return _column_mapping_storage.get(session_id) or None
+
+
+def store_field_selection_result(session_id: str, result: Dict[str, Any]) -> None:
+    """
+    Store the full field selection result (column_mapping list, fields, weight_columns)
+    for structured API responses. Set by select_rate_card_fields.
+    """
+    if not result:
+        return
+    _field_selection_result_storage[session_id] = {
+        "column_mapping": result.get("column_mapping", []),
+        "fields": result.get("fields", []),
+        "weight_columns": result.get("weight_columns", []),
+    }
+    logger.info(f"Stored field selection result for session {session_id}")
+
+
+def get_field_selection_result(session_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """
+    Get the stored field selection result for current or specified session.
+    Returns None if none stored.
+    """
+    if session_id is None:
+        session_id = get_session_id()
+    return _field_selection_result_storage.get(session_id) or None
 
 
 def store_rate_card_path(session_id: str, excel_file_path: str) -> None:
