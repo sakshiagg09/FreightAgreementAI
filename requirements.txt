@@ -194,4 +194,3 @@ yarl==1.20.1
 youtube-transcript-api==1.0.3
 zipp==3.23.0
 zstandard==0.23.0
-arize-phoenix-otel==0.14.0

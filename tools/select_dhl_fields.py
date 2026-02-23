@@ -14,10 +14,6 @@ from utils.system_field_mapping import SYSTEM_FIELD_MAPPING
 from utils.excel_semantic_embedding import match_labels_to_system_fields
 from utils.session_context import get_session_id, store_column_mapping, store_excel_header_row, store_rate_card_path, store_field_selection_result
 
-# Import Phoenix tracing
-from utils.phoenix_tracing import spa_upload_tracer
-from opentelemetry.trace import get_current_span, Status, StatusCode
-
 logger = logging.getLogger(__name__)
 
 # Extract field descriptions for backward compatibility
@@ -407,31 +403,19 @@ def _build_matched_and_weights(
     return matched_fields, weight_labels
 
 
-@spa_upload_tracer.tool(
-    name="select_rate_card_fields",
-    description="Matches Excel rate card columns with DHL system field descriptions using semantic search. Works for both row- and column-oriented layouts.",
-)
 def select_rate_card_fields(file_path: str) -> str:
     """Matches Excel labels (rows or columns) with DHL field descriptions via embeddings."""
     logger.info(f"Tool select_rate_card_fields called for: {file_path}")
-    span = get_current_span()
 
     try:
         if not file_path or not isinstance(file_path, str):
-            error_msg = "Error: Invalid file path provided."
-            if span and span.is_recording():
-                span.set_attribute("output.error", error_msg)
-                span.set_status(Status(StatusCode.ERROR, error_msg))
-            return error_msg
+            return "Error: Invalid file path provided."
 
         file_path = os.path.abspath(os.path.expanduser(file_path))
 
         if not os.path.exists(file_path):
             error_msg = f"Error: File not found at path: {file_path}"
             logger.error(error_msg)
-            if span and span.is_recording():
-                span.set_attribute("output.error", error_msg)
-                span.set_status(Status(StatusCode.ERROR, error_msg))
             return error_msg
 
         file_ext = os.path.splitext(file_path)[1].lower()
@@ -441,18 +425,12 @@ def select_rate_card_fields(file_path: str) -> str:
                 f"but received: {file_ext}. Please upload a valid Excel document."
             )
             logger.error(error_msg)
-            if span and span.is_recording():
-                span.set_attribute("output.error", error_msg)
-                span.set_status(Status(StatusCode.ERROR, error_msg))
             return error_msg
 
         file_size = os.path.getsize(file_path)
         if file_size == 0:
             error_msg = "Error: The uploaded file is empty or corrupted. Please upload a valid Excel file."
             logger.error(error_msg)
-            if span and span.is_recording():
-                span.set_attribute("output.error", error_msg)
-                span.set_status(Status(StatusCode.ERROR, error_msg))
             return error_msg
 
         try:
@@ -469,9 +447,6 @@ def select_rate_card_fields(file_path: str) -> str:
                     f"Error: Failed to read Excel file. {str(read_error)}. "
                     "Please verify the file is a valid Excel document (.xls or .xlsx)."
                 )
-            if span and span.is_recording():
-                span.set_attribute("output.error", error_msg)
-                span.set_status(Status(StatusCode.ERROR, error_msg))
             return error_msg
 
         # Detect "header far down" (e.g. Roberts Europe ratesheet with header at row 18)
@@ -493,9 +468,6 @@ def select_rate_card_fields(file_path: str) -> str:
                 header_start + header_window - 1,
                 MAX_HEADER_COLS,
             )
-            if span and span.is_recording():
-                span.set_attribute("output.error", error_msg)
-                span.set_status(Status(StatusCode.ERROR, error_msg))
             return error_msg
 
         # --- Strategy 1: merged column labels (multi-row headers or header far down) ---
@@ -572,8 +544,6 @@ def select_rate_card_fields(file_path: str) -> str:
 
         if not label_matches:
             logger.warning("No semantic matches above threshold; returning empty field list.")
-            if span and span.is_recording():
-                span.set_attribute("output.matched_count", 0)
             return json.dumps(
                 {"fields": [], "column_mapping": [], "weight_columns": []},
                 indent=2,
@@ -637,12 +607,6 @@ def select_rate_card_fields(file_path: str) -> str:
         if use_header_far_down:
             store_excel_header_row(session_id, header_start)
 
-        if span and span.is_recording():
-            span.set_attribute("output.layout", layout)
-            span.set_attribute("output.header_index", header_index)
-            span.set_attribute("output.matched_count", len(unique_matched))
-            span.set_attribute("output.weight_cols_count", len(ordered_weight_cols))
-
         # Build user-visible mapping: Excel column -> system field (key + description)
         mapping_display = []
         for m in unique_matched:
@@ -664,8 +628,6 @@ def select_rate_card_fields(file_path: str) -> str:
 
     except Exception as e:
         logger.error(f"Field selection error: {e}")
-        if span and span.is_recording():
-            span.set_status(Status(StatusCode.ERROR, str(e)))
         return f"Error matching fields: {str(e)}"
 
 
