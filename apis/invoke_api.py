@@ -1,11 +1,21 @@
+import json
 import os
 import logging
 import re
-from typing import Optional
+from typing import Any, Optional
 from fastapi import FastAPI, UploadFile, File, Form, APIRouter
 from google.genai import types  # type: ignore
 from agent.logistics_agent import runner, session_service
-from utils.session_context import set_session_id, store_rate_card_path
+from utils.session_context import (
+    set_session_id,
+    store_rate_card_path,
+    set_field_selection_retry_requested,
+    get_field_selection_result,
+    store_field_selection_result,
+    store_column_mapping,
+    store_unselected_field_mappings,
+    get_unselected_field_mappings,
+)
 from utils.llm_usage import reset_llm_usage, get_llm_usage
 from config.dev_config import TEMP_UPLOADS_DIR, APP_NAME, DEFAULT_USER_ID
 
@@ -14,11 +24,33 @@ logger = logging.getLogger(__name__)
 # Define the router for the logistics API
 router = APIRouter()
 
+def _parse_selected_field_keys(value: Optional[str]) -> set[str]:
+    """Parse selected_field_keys from JSON array or comma-separated string. Returns set of system_field_key."""
+    if not value or not value.strip():
+        return set()
+    raw = value.strip()
+    # Handle form values like ["TSP","LANE"] or [\"TSP\",\"LANE\"] (Postman/form escaped quotes)
+    if raw.startswith("["):
+        normalized = raw.replace('\\"', '"')
+        try:
+            keys = json.loads(normalized)
+            return set(str(k).strip() for k in keys if k)
+        except (json.JSONDecodeError, TypeError):
+            pass
+        # Fallback: strip [ ], split by ",", strip quotes from each
+        inner = raw.strip("[]").strip()
+        if inner:
+            parts = [p.strip().strip('"').strip("'").strip() for p in inner.split(",") if p.strip()]
+            return set(p for p in parts if p)
+    return set(k.strip().strip('"').strip("'") for k in raw.split(",") if k.strip())
+
+
 @router.post("/invoke")
 async def invoke(
     session_id: str = Form(...),
     message: Optional[str] = Form(None),
-    file: Optional[UploadFile] = File(None)
+    file: Optional[UploadFile] = File(None),
+    selected_field_keys: Optional[str] = Form(None),
 ):
     user_id = DEFAULT_USER_ID
     actual_message = message or ""
@@ -65,6 +97,54 @@ async def invoke(
     if not actual_message:
         actual_message = "Hello"
 
+    # When user clicks Retry (e.g. "Retry" or "retry field selection"), set session flag
+    # so select_rate_card_fields uses retry logic even if the agent doesn't pass enable_retries
+    _msg_lower = actual_message.strip().lower()
+    if _msg_lower in ("retry", "retry field selection", "retry with retries") or (
+        _msg_lower.startswith("retry") and len(actual_message.strip()) < 80
+    ):
+        set_field_selection_retry_requested(session_id)
+
+    # When user clicks Validate with a subset of checkboxes, keep only selected in column_mapping and store unselected
+    unselected_field_mappings: Optional[list] = None
+    if (
+        _msg_lower in ("validate", "validate mapping", "validate mappings")
+        or (_msg_lower.startswith("validate") and len(actual_message.strip()) < 60)
+    ) and selected_field_keys:
+        selected_keys = _parse_selected_field_keys(selected_field_keys)
+        if selected_keys:
+            current = get_field_selection_result(session_id=session_id)
+            # Tool may have stored under "default" when running in another thread; use as fallback
+            if not current and session_id != "default":
+                current = get_field_selection_result(session_id="default")
+            if current and current.get("column_mapping"):
+                mapping_list = current.get("column_mapping") or []
+                selected_list = [m for m in mapping_list if (m.get("system_field_key") or "").strip() in selected_keys]
+                unselected_list = [m for m in mapping_list if (m.get("system_field_key") or "").strip() not in selected_keys]
+                if selected_list is not mapping_list:
+                    new_dict = {m["system_field_key"]: m.get("excel_column") or "" for m in selected_list}
+                    new_fields = (current.get("fields") or [])[:]
+                    weight_cols = set(current.get("weight_columns") or [])
+                    new_fields = [f for f in new_fields if f in new_dict or f in weight_cols]
+                    store_column_mapping(session_id, new_dict)
+                    store_field_selection_result(
+                        session_id,
+                        {
+                            "column_mapping": selected_list,
+                            "column_mapping_dict": new_dict,
+                            "fields": new_fields,
+                            "weight_columns": current.get("weight_columns") or [],
+                        },
+                    )
+                    store_unselected_field_mappings(session_id, unselected_list)
+                    unselected_field_mappings = unselected_list
+                    logger.info(
+                        "Validate with selection: kept %d mapping(s), stored %d unselected for session %s",
+                        len(selected_list),
+                        len(unselected_list),
+                        session_id,
+                    )
+
     final_response = ""
     try:
         set_session_id(session_id)
@@ -76,18 +156,42 @@ async def invoke(
         user_message = types.Content(role="user", parts=[types.Part.from_text(text=actual_message)])
         events = runner.run(user_id=user_id, session_id=session_id, new_message=user_message)
 
+        # Extract field selection from tool response in events (session context may not propagate to tools)
+        field_selection_result: Optional[dict[str, Any]] = None
         for event in events:
-            if hasattr(event, 'content') and hasattr(event.content, 'parts'):
+            if hasattr(event, "content") and hasattr(event.content, "parts"):
                 for part in event.content.parts:
-                    if hasattr(part, 'text') and part.text:
+                    if hasattr(part, "text") and part.text:
                         final_response += part.text
-            elif hasattr(event, 'text'):
+                    # Capture select_rate_card_fields tool output so we can return it for the UI
+                    if hasattr(part, "function_response") and part.function_response:
+                        name = getattr(part.function_response, "name", "") or ""
+                        if name == "select_rate_card_fields":
+                            raw = getattr(part.function_response, "response", None)
+                            if isinstance(raw, str):
+                                try:
+                                    field_selection_result = json.loads(raw)
+                                except json.JSONDecodeError:
+                                    pass
+                            elif isinstance(raw, dict):
+                                field_selection_result = raw
+            elif hasattr(event, "text"):
                 final_response += event.text
 
         usage = get_llm_usage(session_id)
+        # Prefer result from events; fallback to session storage. Persist to session so Validate can use it.
+        if field_selection_result is None:
+            field_selection_result = get_field_selection_result(session_id=session_id)
+        elif field_selection_result:
+            store_field_selection_result(session_id, field_selection_result)
+        # Include unselected list when we have it (e.g. after Validate with selection)
+        if unselected_field_mappings is None:
+            unselected_field_mappings = get_unselected_field_mappings(session_id=session_id)
         return {
             "session_id": session_id,
             "response": final_response or "I'm ready to help. Please provide the document.",
+            "field_selection_result": field_selection_result,
+            "unselected_field_mappings": unselected_field_mappings,
             "usage": usage,
         }
     except Exception as e:

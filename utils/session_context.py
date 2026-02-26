@@ -32,6 +32,14 @@ _excel_header_row_storage: Dict[str, Optional[int]] = {}
 # session_id -> {"column_mapping": [...], "fields": [...], "weight_columns": [...]}
 _field_selection_result_storage: Dict[str, Dict[str, Any]] = {}
 
+# Flag: user requested retry for field selection (e.g. clicked Retry button in UI)
+# When set, select_rate_card_fields will use retry logic regardless of enable_retries param.
+_field_selection_retry_requested: Dict[str, bool] = {}
+
+# Unselected field mappings: when user validates with a subset of checkboxes,
+# mappings that were not selected are stored here (list of {excel_column, system_field_key, system_field_description}).
+_unselected_field_mappings_storage: Dict[str, list] = {}
+
 def set_session_id(session_id: str):
     """Set the current session ID in context"""
     _current_session_id.set(session_id)
@@ -184,6 +192,7 @@ def store_field_selection_result(session_id: str, result: Dict[str, Any]) -> Non
         return
     _field_selection_result_storage[session_id] = {
         "column_mapping": result.get("column_mapping", []),
+        "column_mapping_dict": result.get("column_mapping_dict", {}),
         "fields": result.get("fields", []),
         "weight_columns": result.get("weight_columns", []),
     }
@@ -198,6 +207,25 @@ def get_field_selection_result(session_id: Optional[str] = None) -> Optional[Dic
     if session_id is None:
         session_id = get_session_id()
     return _field_selection_result_storage.get(session_id) or None
+
+
+def store_unselected_field_mappings(session_id: str, mappings: list) -> None:
+    """
+    Store the list of field mappings that the user did not select when validating.
+    Each item is a dict with excel_column, system_field_key, system_field_description.
+    """
+    _unselected_field_mappings_storage[session_id] = list(mappings) if mappings else []
+    logger.info("Stored %d unselected field mapping(s) for session %s", len(_unselected_field_mappings_storage[session_id]), session_id)
+
+
+def get_unselected_field_mappings(session_id: Optional[str] = None) -> Optional[list]:
+    """
+    Get the list of field mappings that were unselected at last validate.
+    Returns None if none stored.
+    """
+    if session_id is None:
+        session_id = get_session_id()
+    return _unselected_field_mappings_storage.get(session_id)
 
 
 def store_rate_card_path(session_id: str, excel_file_path: str) -> None:
@@ -221,6 +249,28 @@ def get_rate_card_path(session_id: Optional[str] = None) -> Optional[str]:
     if session_id is None:
         session_id = get_session_id()
     return _rate_card_path_storage.get(session_id)
+
+
+def set_field_selection_retry_requested(session_id: str) -> None:
+    """
+    Mark that the user requested a retry for field selection (e.g. clicked Retry in UI).
+    select_rate_card_fields will use retry logic when this flag is set.
+    """
+    _field_selection_retry_requested[session_id] = True
+    logger.info("Field selection retry requested for session %s", session_id)
+
+
+def get_and_clear_field_selection_retry_requested(session_id: Optional[str] = None) -> bool:
+    """
+    Return True if retry was requested for this session, and clear the flag (one-shot).
+    Used by select_rate_card_fields to enable retries without relying on the agent passing enable_retries.
+    """
+    if session_id is None:
+        session_id = get_session_id()
+    requested = _field_selection_retry_requested.pop(session_id, False)
+    if requested:
+        logger.info("Using retry logic for field selection (session %s)", session_id)
+    return requested
 
 
 def clear_session_uuids(session_id: str):

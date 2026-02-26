@@ -7,12 +7,21 @@ import json
 import logging
 import re
 import os
+import time
 import pandas as pd
 import requests
 from google.adk.tools import FunctionTool
 from utils.system_field_mapping import SYSTEM_FIELD_MAPPING
 from utils.excel_semantic_embedding import match_labels_to_system_fields
-from utils.session_context import get_session_id, store_column_mapping, store_excel_header_row, store_rate_card_path, store_field_selection_result
+from utils.session_context import (
+    get_session_id,
+    get_rate_card_path,
+    get_and_clear_field_selection_retry_requested,
+    store_column_mapping,
+    store_excel_header_row,
+    store_rate_card_path,
+    store_field_selection_result,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +67,10 @@ HEADER_WINDOW_ROWS = 4
 
 # Row index used by downstream when no header row is detected (e.g. sap_upload_tool header=2)
 HEADER_ROW_FOR_DOWNSTREAM = 2
+
+# Retry config (only when user enables retries)
+SELECT_FIELDS_MAX_RETRIES = 3
+SELECT_FIELDS_RETRY_DELAY_SECONDS = 2
 
 # Minimum cosine similarity to accept a label -> system field match
 SIMILARITY_THRESHOLD = 0.45
@@ -403,232 +416,288 @@ def _build_matched_and_weights(
     return matched_fields, weight_labels
 
 
-def select_rate_card_fields(file_path: str) -> str:
-    """Matches Excel labels (rows or columns) with DHL field descriptions via embeddings."""
-    logger.info(f"Tool select_rate_card_fields called for: {file_path}")
+def _select_rate_card_fields_impl(file_path: str) -> str:
+    """
+    Core implementation of rate card field selection. May raise on transient failures
+    (e.g. network, timeout); returns error strings for validation failures.
+    """
+    if not file_path or not isinstance(file_path, str):
+        return "Error: Invalid file path provided."
+
+    file_path = os.path.abspath(os.path.expanduser(file_path))
+
+    if not os.path.exists(file_path):
+        error_msg = f"Error: File not found at path: {file_path}"
+        logger.error(error_msg)
+        return error_msg
+
+    file_ext = os.path.splitext(file_path)[1].lower()
+    if file_ext not in [".xls", ".xlsx"]:
+        error_msg = (
+            f"Error: Invalid file format. Expected Excel file (.xls or .xlsx), "
+            f"but received: {file_ext}. Please upload a valid Excel document."
+        )
+        logger.error(error_msg)
+        return error_msg
+
+    file_size = os.path.getsize(file_path)
+    if file_size == 0:
+        error_msg = "Error: The uploaded file is empty or corrupted. Please upload a valid Excel file."
+        logger.error(error_msg)
+        return error_msg
 
     try:
-        if not file_path or not isinstance(file_path, str):
-            return "Error: Invalid file path provided."
-
-        file_path = os.path.abspath(os.path.expanduser(file_path))
-
-        if not os.path.exists(file_path):
-            error_msg = f"Error: File not found at path: {file_path}"
-            logger.error(error_msg)
-            return error_msg
-
-        file_ext = os.path.splitext(file_path)[1].lower()
-        if file_ext not in [".xls", ".xlsx"]:
+        df = _read_excel_grid(file_path)
+    except Exception as read_error:
+        error_type = type(read_error).__name__
+        logger.error(f"Failed to read Excel file: {error_type}: {read_error}")
+        if "No such file" in str(read_error) or "FileNotFoundError" in error_type:
+            error_msg = f"Error: File not found or cannot be accessed: {file_path}"
+        elif "Permission" in error_type or "permission" in str(read_error).lower():
+            error_msg = "Error: Permission denied. Cannot read file."
+        else:
             error_msg = (
-                f"Error: Invalid file format. Expected Excel file (.xls or .xlsx), "
-                f"but received: {file_ext}. Please upload a valid Excel document."
+                f"Error: Failed to read Excel file. {str(read_error)}. "
+                "Please verify the file is a valid Excel document (.xls or .xlsx)."
             )
-            logger.error(error_msg)
-            return error_msg
+        return error_msg
 
-        file_size = os.path.getsize(file_path)
-        if file_size == 0:
-            error_msg = "Error: The uploaded file is empty or corrupted. Please upload a valid Excel file."
-            logger.error(error_msg)
-            return error_msg
+    # Detect "header far down" (e.g. Roberts Europe ratesheet with header at row 18)
+    detected_header = _detect_header_row(df)
+    if detected_header is not None:
+        header_start = detected_header
+        header_window = HEADER_WINDOW_ROWS
+        use_header_far_down = True
+        logger.info("Detected header row at index %d (header-far-down template).", detected_header)
+    else:
+        header_start = 0
+        header_window = MAX_HEADER_ROWS
+        use_header_far_down = False
 
-        try:
-            df = _read_excel_grid(file_path)
-        except Exception as read_error:
-            error_type = type(read_error).__name__
-            logger.error(f"Failed to read Excel file: {error_type}: {read_error}")
-            if "No such file" in str(read_error) or "FileNotFoundError" in error_type:
-                error_msg = f"Error: File not found or cannot be accessed: {file_path}"
-            elif "Permission" in error_type or "permission" in str(read_error).lower():
-                error_msg = "Error: Permission denied. Cannot read file."
-            else:
-                error_msg = (
-                    f"Error: Failed to read Excel file. {str(read_error)}. "
-                    "Please verify the file is a valid Excel document (.xls or .xlsx)."
-                )
-            return error_msg
-
-        # Detect "header far down" (e.g. Roberts Europe ratesheet with header at row 18)
-        detected_header = _detect_header_row(df)
-        if detected_header is not None:
-            header_start = detected_header
-            header_window = HEADER_WINDOW_ROWS
-            use_header_far_down = True
-            logger.info("Detected header row at index %d (header-far-down template).", detected_header)
-        else:
-            header_start = 0
-            header_window = MAX_HEADER_ROWS
-            use_header_far_down = False
-
-        units = _extract_semantic_units(df, start_row=header_start, max_rows=header_window)
-        if not units:
-            error_msg = "Error: No valid header labels found in the Excel file (rows %d–%d, up to %d columns)." % (
-                header_start,
-                header_start + header_window - 1,
-                MAX_HEADER_COLS,
-            )
-            return error_msg
-
-        # --- Strategy 1: merged column labels (multi-row headers or header far down) ---
-        merged_col_labels = _extract_merged_column_labels(
-            df, MAX_MERGED_HEADER_ROWS, start_row=header_start
+    units = _extract_semantic_units(df, start_row=header_start, max_rows=header_window)
+    if not units:
+        error_msg = "Error: No valid header labels found in the Excel file (rows %d–%d, up to %d columns)." % (
+            header_start,
+            header_start + header_window - 1,
+            MAX_HEADER_COLS,
         )
-        merged_col_labels = [(c, label) for c, label in merged_col_labels if not _should_exclude_label(label)]
-        merged_col_texts = [label for _c, label in merged_col_labels]
-        merged_col_matches = match_labels_to_system_fields(
-            merged_col_texts, similarity_threshold=SIMILARITY_THRESHOLD
-        ) if merged_col_texts else []
+        return error_msg
 
-        # --- Strategy 2: merged row labels (row-oriented layout) ---
-        merged_row_labels = _extract_merged_row_labels(df, MAX_MERGED_HEADER_COLS)
-        merged_row_labels = [(r, label) for r, label in merged_row_labels if not _should_exclude_label(label)]
-        merged_row_texts = [label for _r, label in merged_row_labels]
-        merged_row_matches = match_labels_to_system_fields(
-            merged_row_texts, similarity_threshold=SIMILARITY_THRESHOLD
-        ) if merged_row_texts else []
+    # --- Strategy 1: merged column labels (multi-row headers or header far down) ---
+    merged_col_labels = _extract_merged_column_labels(
+        df, MAX_MERGED_HEADER_ROWS, start_row=header_start
+    )
+    merged_col_labels = [(c, label) for c, label in merged_col_labels if not _should_exclude_label(label)]
+    merged_col_texts = [label for _c, label in merged_col_labels]
+    merged_col_matches = match_labels_to_system_fields(
+        merged_col_texts, similarity_threshold=SIMILARITY_THRESHOLD
+    ) if merged_col_texts else []
 
-        # --- Strategy 3: flat cell-by-cell (original) ---
-        label_texts = [t for _r, _c, t in units]
-        flat_matches = match_labels_to_system_fields(
-            label_texts, similarity_threshold=SIMILARITY_THRESHOLD
+    # --- Strategy 2: merged row labels (row-oriented layout) ---
+    merged_row_labels = _extract_merged_row_labels(df, MAX_MERGED_HEADER_COLS)
+    merged_row_labels = [(r, label) for r, label in merged_row_labels if not _should_exclude_label(label)]
+    merged_row_texts = [label for _r, label in merged_row_labels]
+    merged_row_matches = match_labels_to_system_fields(
+        merged_row_texts, similarity_threshold=SIMILARITY_THRESHOLD
+    ) if merged_row_texts else []
+
+    # --- Strategy 3: flat cell-by-cell (original) ---
+    label_texts = [t for _r, _c, t in units]
+    flat_matches = match_labels_to_system_fields(
+        label_texts, similarity_threshold=SIMILARITY_THRESHOLD
+    )
+
+    # Choose best strategy: prefer merged column if it gives enough matches (multi-row template)
+    use_merged_column = (
+        len(merged_col_matches) >= MIN_MERGED_MATCHES_TO_PREFER
+        and len(merged_col_matches) >= len(merged_row_matches)
+    )
+    use_merged_row = (
+        not use_merged_column
+        and len(merged_row_matches) >= MIN_MERGED_MATCHES_TO_PREFER
+        and len(merged_row_matches) > len(merged_col_matches)
+    )
+
+    if use_merged_column:
+        # One unit per column: (0, col_idx, merged_label) for consistent layout index
+        units = [(0, c, label) for c, label in merged_col_labels]
+        label_matches = merged_col_matches
+        layout, header_index = "column", 0
+        header_row_for_name = (
+            header_start if use_header_far_down else HEADER_ROW_FOR_DOWNSTREAM
         )
-
-        # Choose best strategy: prefer merged column if it gives enough matches (multi-row template)
-        use_merged_column = (
-            len(merged_col_matches) >= MIN_MERGED_MATCHES_TO_PREFER
-            and len(merged_col_matches) >= len(merged_row_matches)
+        logger.info(
+            "Using merged column header strategy (%d matches).",
+            len(merged_col_matches),
         )
-        use_merged_row = (
-            not use_merged_column
-            and len(merged_row_matches) >= MIN_MERGED_MATCHES_TO_PREFER
-            and len(merged_row_matches) > len(merged_col_matches)
+    elif use_merged_row:
+        # One unit per row: (row_idx, 0, merged_label)
+        units = [(r, 0, label) for r, label in merged_row_labels]
+        label_matches = merged_row_matches
+        layout, header_index = "row", 0
+        header_row_for_name = None
+        logger.info(
+            "Using merged row header strategy (%d matches).",
+            len(merged_row_matches),
         )
-
-        if use_merged_column:
-            # One unit per column: (0, col_idx, merged_label) for consistent layout index
-            units = [(0, c, label) for c, label in merged_col_labels]
-            label_matches = merged_col_matches
-            layout, header_index = "column", 0
-            header_row_for_name = (
-                header_start if use_header_far_down else HEADER_ROW_FOR_DOWNSTREAM
-            )
-            logger.info(
-                "Using merged column header strategy (%d matches).",
-                len(merged_col_matches),
-            )
-        elif use_merged_row:
-            # One unit per row: (row_idx, 0, merged_label)
-            units = [(r, 0, label) for r, label in merged_row_labels]
-            label_matches = merged_row_matches
-            layout, header_index = "row", 0
-            header_row_for_name = None
-            logger.info(
-                "Using merged row header strategy (%d matches).",
-                len(merged_row_matches),
-            )
-        else:
-            # Fall back to flat cell matching
-            label_matches = flat_matches
-            matches_with_pos = [
-                (units[i][0], units[i][1], sk, sc)
-                for i, sk, sc in label_matches
-            ]
-            layout, header_index = _infer_layout(matches_with_pos)
-            header_row_for_name = None
-            logger.info(
-                "Using flat cell strategy; layout=%s, header index=%s.",
-                layout,
-                header_index,
-            )
-
-        if not label_matches:
-            logger.warning("No semantic matches above threshold; returning empty field list.")
-            return json.dumps(
-                {"fields": [], "column_mapping": [], "weight_columns": []},
-                indent=2,
-            )
-
-        matched_fields, ordered_weight_cols = _build_matched_and_weights(
-            df, units, label_matches, layout, header_index, header_row_for_name
+    else:
+        # Fall back to flat cell matching
+        label_matches = flat_matches
+        matches_with_pos = [
+            (units[i][0], units[i][1], sk, sc)
+            for i, sk, sc in label_matches
+        ]
+        layout, header_index = _infer_layout(matches_with_pos)
+        header_row_for_name = None
+        logger.info(
+            "Using flat cell strategy; layout=%s, header index=%s.",
+            layout,
+            header_index,
         )
 
-        # Exclude labels that are too long or bullet/note lines (safety net for merged labels)
-        matched_fields = [m for m in matched_fields if not _should_exclude_label(m["excel_column"])]
+    if not label_matches:
+        logger.warning("No semantic matches above threshold; returning empty field list.")
+        return json.dumps(
+            {"fields": [], "column_mapping": [], "column_mapping_dict": {}, "weight_columns": []},
+            indent=2,
+        )
 
-        # Exclude document/section headings: LLM classifies headings vs column headers; fallback to config if LLM unavailable
-        llm_exclude = _llm_detect_heading_labels(matched_fields)
-        if llm_exclude:
-            matched_fields = [m for m in matched_fields if m["excel_column"] not in llm_exclude]
-        else:
-            config_substrings = _get_exclude_heading_substrings()
-            if config_substrings:
-                matched_fields = [m for m in matched_fields if not _is_heading_label(m["excel_column"], config_substrings)]
+    matched_fields, ordered_weight_cols = _build_matched_and_weights(
+        df, units, label_matches, layout, header_index, header_row_for_name
+    )
 
-        # Deduplicate by system_field_key (keep first occurrence)
-        seen_keys = set()
-        unique_matched = []
-        for m in matched_fields:
-            k = m["system_field_key"]
-            if k not in seen_keys:
-                seen_keys.add(k)
-                unique_matched.append(m)
+    # Exclude labels that are too long or bullet/note lines (safety net for merged labels)
+    matched_fields = [m for m in matched_fields if not _should_exclude_label(m["excel_column"])]
 
-        system_field_keys = [m["system_field_key"] for m in unique_matched]
-        final_fields = system_field_keys + ordered_weight_cols
+    # Exclude document/section headings: LLM classifies headings vs column headers; fallback to config if LLM unavailable
+    llm_exclude = _llm_detect_heading_labels(matched_fields)
+    if llm_exclude:
+        matched_fields = [m for m in matched_fields if m["excel_column"] not in llm_exclude]
+    else:
+        config_substrings = _get_exclude_heading_substrings()
+        if config_substrings:
+            matched_fields = [m for m in matched_fields if not _is_heading_label(m["excel_column"], config_substrings)]
 
-        # Store mapping for SAP / downstream (system_field_key -> excel_column_name).
-        # For origin/destination zone columns, normalize composite merged headers to the
-        # first segment (e.g. "Origin country Minimum € / km ..." -> "Origin country")
-        # so SAP upload can find the column when Excel is read with a single header row.
-        _ORIGIN_DEST_ZONE_KEYS = frozenset({
-            "SOURCELOC_ZONE", "SOURCELOC", "SOURCELOC_CNTRY", "SRCLOC_UNLOCD", "SRC_UNLOCD",
-            "DESTLOC_ZONE", "DESTLOC", "DESTLOC_CNTRY", "DESTLOC_UNLOCD", "DEST_UNLOCD",
-        })
-        _COMPOSITE_HEADER_MARKERS = (" Minimum", " € ", " €/km", " €/ km", "/km")
+    # Deduplicate by system_field_key (keep first occurrence)
+    seen_keys = set()
+    unique_matched = []
+    for m in matched_fields:
+        k = m["system_field_key"]
+        if k not in seen_keys:
+            seen_keys.add(k)
+            unique_matched.append(m)
 
-        def _normalize_origin_dest_column(excel_col: str, system_key: str) -> str:
-            if system_key not in _ORIGIN_DEST_ZONE_KEYS or not excel_col:
-                return excel_col
-            for marker in _COMPOSITE_HEADER_MARKERS:
-                idx = excel_col.find(marker)
-                if idx > 0:
-                    return excel_col[:idx].strip()
+    system_field_keys = [m["system_field_key"] for m in unique_matched]
+    final_fields = system_field_keys + ordered_weight_cols
+
+    # Store mapping for SAP / downstream (system_field_key -> excel_column_name).
+    # For origin/destination zone columns, normalize composite merged headers to the
+    # first segment (e.g. "Origin country Minimum € / km ..." -> "Origin country")
+    # so SAP upload can find the column when Excel is read with a single header row.
+    _ORIGIN_DEST_ZONE_KEYS = frozenset({
+        "SOURCELOC_ZONE", "SOURCELOC", "SOURCELOC_CNTRY", "SRCLOC_UNLOCD", "SRC_UNLOCD",
+        "DESTLOC_ZONE", "DESTLOC", "DESTLOC_CNTRY", "DESTLOC_UNLOCD", "DEST_UNLOCD",
+    })
+    _COMPOSITE_HEADER_MARKERS = (" Minimum", " € ", " €/km", " €/ km", "/km")
+
+    def _normalize_origin_dest_column(excel_col: str, system_key: str) -> str:
+        if system_key not in _ORIGIN_DEST_ZONE_KEYS or not excel_col:
             return excel_col
+        for marker in _COMPOSITE_HEADER_MARKERS:
+            idx = excel_col.find(marker)
+            if idx > 0:
+                return excel_col[:idx].strip()
+        return excel_col
 
-        column_mapping = {}
-        for m in unique_matched:
-            key = m["system_field_key"]
-            excel_col = _normalize_origin_dest_column(m["excel_column"], key)
-            column_mapping[key] = excel_col
-        session_id = get_session_id()
-        store_column_mapping(session_id, column_mapping)
-        store_rate_card_path(session_id, file_path)
-        if use_header_far_down:
-            store_excel_header_row(session_id, header_start)
+    column_mapping = {}
+    for m in unique_matched:
+        key = m["system_field_key"]
+        excel_col = _normalize_origin_dest_column(m["excel_column"], key)
+        column_mapping[key] = excel_col
+    session_id = get_session_id()
+    store_column_mapping(session_id, column_mapping)
+    store_rate_card_path(session_id, file_path)
+    if use_header_far_down:
+        store_excel_header_row(session_id, header_start)
 
-        # Build user-visible mapping: Excel column -> system field (key + description)
-        mapping_display = []
-        for m in unique_matched:
-            sys_key = m["system_field_key"]
-            entry = SYSTEM_FIELD_MAPPING.get(sys_key)
-            description = entry[1] if entry else sys_key
-            mapping_display.append({
-                "excel_column": column_mapping.get(sys_key, m["excel_column"]),
-                "system_field_key": sys_key,
-                "system_field_description": description,
-            })
-        response = {
-            "fields": final_fields,
-            "column_mapping": mapping_display,
-            "weight_columns": ordered_weight_cols,
-        }
-        store_field_selection_result(session_id, response)
-        return json.dumps(response, indent=2)
+    # Build list for UI (e.g. checkboxes / list view) and dict for lookup
+    column_mapping_list = []
+    for m in unique_matched:
+        sys_key = m["system_field_key"]
+        entry = SYSTEM_FIELD_MAPPING.get(sys_key)
+        description = entry[1] if entry else sys_key
+        column_mapping_list.append({
+            "excel_column": column_mapping.get(sys_key, m["excel_column"]),
+            "system_field_key": sys_key,
+            "system_field_description": description,
+        })
+    # column_mapping: list for UI display; column_mapping_dict: dict for lookup (system_field_key -> excel_column)
+    response = {
+        "fields": final_fields,
+        "column_mapping": column_mapping_list,
+        "column_mapping_dict": column_mapping,
+        "weight_columns": ordered_weight_cols,
+    }
+    store_field_selection_result(session_id, response)
+    return json.dumps(response, indent=2)
 
-    except Exception as e:
-        logger.error(f"Field selection error: {e}")
-        return f"Error matching fields: {str(e)}"
+
+def select_rate_card_fields(file_path: str = "", enable_retries: bool = False) -> str:
+    """
+    Matches Excel labels (rows or columns) with DHL field descriptions via embeddings.
+
+    file_path: path to the rate card Excel file. If empty and retries are enabled
+    (e.g. user clicked Retry in the UI), the path from the current session is used.
+    When enable_retries is True (or the user clicked Retry and the API set the session flag),
+    transient failures are retried up to SELECT_FIELDS_MAX_RETRIES times with a short delay.
+    """
+    session_id = get_session_id()
+    # Session flag set by API when user clicks Retry; use retries even if agent didn't pass enable_retries
+    if get_and_clear_field_selection_retry_requested(session_id):
+        enable_retries = True
+    # When user clicks Retry, file_path may be empty; use stored rate card path for this session
+    if not (file_path or "").strip() and enable_retries:
+        stored = get_rate_card_path(session_id)
+        if stored:
+            file_path = stored
+            logger.info("Using stored rate card path for retry: %s", file_path)
+    if not (file_path or "").strip():
+        return "Error: No file path provided and no rate card path is stored for this session. Please upload the rate card again or provide the file path."
+
+    file_path = (file_path or "").strip()
+    logger.info(
+        "Tool select_rate_card_fields called for: %s (enable_retries=%s)",
+        file_path,
+        enable_retries,
+    )
+
+    if not enable_retries:
+        try:
+            return _select_rate_card_fields_impl(file_path)
+        except Exception as e:
+            logger.error("Field selection error: %s", e)
+            return f"Error matching fields: {str(e)}"
+
+    last_error: Exception | None = None
+    for attempt in range(SELECT_FIELDS_MAX_RETRIES):
+        try:
+            result = _select_rate_card_fields_impl(file_path)
+            # Validation errors are returned as strings; don't retry those
+            if result.strip().startswith("Error:"):
+                return result
+            return result
+        except Exception as e:
+            last_error = e
+            logger.warning(
+                "Field selection attempt %d/%d failed: %s",
+                attempt + 1,
+                SELECT_FIELDS_MAX_RETRIES,
+                e,
+            )
+            if attempt < SELECT_FIELDS_MAX_RETRIES - 1:
+                time.sleep(SELECT_FIELDS_RETRY_DELAY_SECONDS)
+    logger.error("Field selection failed after %d attempts: %s", SELECT_FIELDS_MAX_RETRIES, last_error)
+    return f"Error matching fields after {SELECT_FIELDS_MAX_RETRIES} retries: {str(last_error)}"
 
 
 field_selection_tool = FunctionTool(select_rate_card_fields)
