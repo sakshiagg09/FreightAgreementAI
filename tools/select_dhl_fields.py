@@ -632,14 +632,19 @@ def _select_rate_card_fields_impl(file_path: str) -> str:
             "system_field_description": description,
         })
     # column_mapping: list for UI display; column_mapping_dict: dict for lookup (system_field_key -> excel_column)
+    # Store full result so Validate (selected_field_keys) can filter; API expects column_mapping list + fields + weight_columns
+    system_field_keys = [m["system_field_key"] for m in column_mapping_list]
     response = {
-        "fields": final_fields,
         "column_mapping": column_mapping_list,
         "column_mapping_dict": column_mapping,
-        "weight_columns": ordered_weight_cols,
+        "fields": system_field_keys + list(ordered_weight_cols),
+        "weight_columns": list(ordered_weight_cols),
     }
     store_field_selection_result(session_id, response)
-    return json.dumps(response, indent=2)
+    return json.dumps(
+        {"column_mapping_dict": column_mapping, "column_mapping": column_mapping_list},
+        indent=2,
+    )
 
 
 def select_rate_card_fields(file_path: str = "", enable_retries: bool = False) -> str:

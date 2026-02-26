@@ -17,6 +17,7 @@ from utils.session_context import (
     get_unselected_field_mappings,
 )
 from utils.llm_usage import reset_llm_usage, get_llm_usage
+from utils.system_field_mapping import SYSTEM_FIELD_MAPPING
 from config.dev_config import TEMP_UPLOADS_DIR, APP_NAME, DEFAULT_USER_ID
 
 logger = logging.getLogger(__name__)
@@ -107,6 +108,7 @@ async def invoke(
 
     # When user clicks Validate with a subset of checkboxes, keep only selected in column_mapping and store unselected
     unselected_field_mappings: Optional[list] = None
+    validated_field_selection_result: Optional[dict[str, Any]] = None
     if (
         _msg_lower in ("validate", "validate mapping", "validate mappings")
         or (_msg_lower.startswith("validate") and len(actual_message.strip()) < 60)
@@ -117,8 +119,22 @@ async def invoke(
             # Tool may have stored under "default" when running in another thread; use as fallback
             if not current and session_id != "default":
                 current = get_field_selection_result(session_id="default")
-            if current and current.get("column_mapping"):
-                mapping_list = current.get("column_mapping") or []
+            # Build mapping list from stored result; support legacy storage that only has column_mapping_dict
+            mapping_list = (current.get("column_mapping") or []) if current else []
+            if not mapping_list and current and current.get("column_mapping_dict"):
+                cm_dict = current.get("column_mapping_dict") or {}
+                mapping_list = []
+                for sys_key, excel_col in cm_dict.items():
+                    if not sys_key:
+                        continue
+                    entry = SYSTEM_FIELD_MAPPING.get(sys_key)
+                    description = entry[1] if entry else sys_key
+                    mapping_list.append({
+                        "excel_column": excel_col or "",
+                        "system_field_key": sys_key,
+                        "system_field_description": description,
+                    })
+            if current and mapping_list:
                 selected_list = [m for m in mapping_list if (m.get("system_field_key") or "").strip() in selected_keys]
                 unselected_list = [m for m in mapping_list if (m.get("system_field_key") or "").strip() not in selected_keys]
                 if selected_list is not mapping_list:
@@ -138,6 +154,12 @@ async def invoke(
                     )
                     store_unselected_field_mappings(session_id, unselected_list)
                     unselected_field_mappings = unselected_list
+                    validated_field_selection_result = {
+                        "column_mapping": selected_list,
+                        "column_mapping_dict": new_dict,
+                        "fields": new_fields,
+                        "weight_columns": current.get("weight_columns") or [],
+                    }
                     logger.info(
                         "Validate with selection: kept %d mapping(s), stored %d unselected for session %s",
                         len(selected_list),
@@ -179,18 +201,37 @@ async def invoke(
                 final_response += event.text
 
         usage = get_llm_usage(session_id)
-        # Prefer result from events; fallback to session storage. Persist to session so Validate can use it.
-        if field_selection_result is None:
+        # Prefer validated result from this request's Validate step, then from events, then session storage.
+        if validated_field_selection_result is not None:
+            field_selection_result = validated_field_selection_result
+        elif field_selection_result is None:
             field_selection_result = get_field_selection_result(session_id=session_id)
         elif field_selection_result:
             store_field_selection_result(session_id, field_selection_result)
+        # If tool/ADK returned {"result": "<json string>"}, parse the inner string so we expose real dicts
+        if isinstance(field_selection_result, dict) and "result" in field_selection_result:
+            raw_result = field_selection_result.get("result")
+            if isinstance(raw_result, str) and raw_result.strip():
+                try:
+                    parsed = json.loads(raw_result)
+                    if isinstance(parsed, dict):
+                        field_selection_result = parsed
+                        store_field_selection_result(session_id, field_selection_result)
+                except json.JSONDecodeError:
+                    pass
         # Include unselected list when we have it (e.g. after Validate with selection)
         if unselected_field_mappings is None:
             unselected_field_mappings = get_unselected_field_mappings(session_id=session_id)
+        # Expose column_mapping_dict (and full field selection) as top-level "result" for clients
+        result_payload = None
+        if field_selection_result and isinstance(field_selection_result, dict):
+            result_payload = field_selection_result.get("column_mapping_dict")
+            if result_payload is None and field_selection_result:
+                result_payload = field_selection_result
         return {
             "session_id": session_id,
             "response": final_response or "I'm ready to help. Please provide the document.",
-            "field_selection_result": field_selection_result,
+            "result": result_payload,
             "unselected_field_mappings": unselected_field_mappings,
             "usage": usage,
         }
